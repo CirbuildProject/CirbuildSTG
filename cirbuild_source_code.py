@@ -363,37 +363,28 @@ if __name__ == "__main__":
     verifier_agent = CirbuildVerifierAgent(model_name=DEFAULT_MODEL) 
     
     try:
-        # Phase 1: Generation
+        # ---------------------------------------------------------
+        # Phase 1: Core Generation
+        # ---------------------------------------------------------
         plan = coder_agent.understand_and_plan(sample_spec)
         py_model = coder_agent.generate_python_gold_model(plan)
         cpp_target = coder_agent.generate_hls_cpp(py_model, plan.target_compiler)
-
-        # Phase 1.5: Verification Generation (NEW)
-        cpp_tb = verifier_agent.generate_cpp_testbench(plan, plan.target_compiler)
-
-        safe_name = plan.module_name.strip().lower().replace(" ", "_").replace("-", "_")
         
-        # Save Cpp 
+        safe_name = plan.module_name.strip().lower().replace(" ", "_").replace("-", "_")
         output_filename = f"{safe_name}_hls.cpp"
+        
         with open(output_filename, "w") as file:
             file.write(cpp_target.cpp_code.replace('\\n', '\n'))
-        print(f"\n✅ Initial C++ Code Saved to {output_filename}")
+            
+        print(f"\n✅ Phase 1: Initial C++ Code Saved to {output_filename}")
 
-        # Save Testbench
-        tb_filename = f"{safe_name}_tb.cpp"
-        with open(tb_filename, "w") as file:
-            # We inject an #include to link the testbench to the main module file
-            include_statement = f'#include "{output_filename}"\n\n'
-            file.write(include_statement + cpp_tb.testbench_code.replace('\\n', '\n'))
-        print(f"✅ C++ Testbench Saved to {tb_filename}")
-        print(f"   Test Scenarios Covered: {cpp_tb.test_cases_covered}")
-
-        # Phase 2: Reflection
-        # (For this to work locally without Vitis, you can manually inject a typo into the file here to test it)
+        # ---------------------------------------------------------
+        # Phase 2: Core Syntax Check & Reflection
+        # ---------------------------------------------------------
         compile_status = reflection_agent.mock_compile_check(output_filename)
         
         if compile_status != "SUCCESS":
-            print(f"\n❌ Compilation Failed. Passing to Reflection Agent...\nError:\n{compile_status}")
+            print(f"\n❌ Phase 2: Core Compilation Failed. Passing to Reflection Agent...\nError:\n{compile_status}")
             
             correction = reflection_agent.fix_compilation_error(cpp_target.cpp_code, compile_status, plan.target_compiler)
             
@@ -401,10 +392,61 @@ if __name__ == "__main__":
                 file.write(correction.fixed_cpp_code.replace('\\n', '\n'))
                 
             print(f"\n🔧 Code Fixed! Explanation: {correction.explanation}")
-            print("\n--- REVISED C++ HLS CODE ---")
-            print(correction.fixed_cpp_code)
         else:
-            print("\n✅ Code passed syntax check on the first try!")
+            print("\n✅ Phase 2: Core C++ passed syntax check on the first try!")
+
+        # ---------------------------------------------------------
+        # Phase 3: Testbench Generation
+        # ---------------------------------------------------------
+        cpp_tb = verifier_agent.generate_cpp_testbench(plan, plan.target_compiler)
+        
+        tb_filename = f"{safe_name}_tb.cpp"
+        with open(tb_filename, "w") as file:
+            include_statement = f'#include "{output_filename}"\n\n'
+            file.write(include_statement + cpp_tb.testbench_code.replace('\\n', '\n'))
+            
+        print(f"\n✅ Phase 3: C++ Testbench Saved to {tb_filename}")
+        print(f"   Test Scenarios Covered: {cpp_tb.test_cases_covered}")
+
+        # ---------------------------------------------------------
+        # Phase 4: Full Compilation & Execution
+        # ---------------------------------------------------------
+        print(f"\n⚙️ Phase 4: Compiling and Executing Testbench in WSL...")
+        executable_name = f"./{safe_name}_tb_exec"
+
+        try:
+            # 1. Compile the testbench (which includes the core code)
+            subprocess.run(
+                ["g++", tb_filename, "-o", executable_name],
+                capture_output=True,
+                text=True,
+                check=True 
+            )
+            print("✅ Compilation Successful.")
+
+            # 2. Run the compiled executable
+            run_process = subprocess.run(
+                [executable_name],
+                capture_output=True,
+                text=True,
+                check=True 
+            )
+
+            print("\n📊 Testbench Output:")
+            print(run_process.stdout.strip())
+
+            # 3. Verify the output
+            if "TEST PASSED" in run_process.stdout:
+                print("\n🏆 VERIFICATION SUCCESSFUL: The hardware logic is functionally correct!")
+            else:
+                print("\n❌ VERIFICATION FAILED: The logic did not produce the expected outputs.")
+
+        except subprocess.CalledProcessError as e:
+            print(f"\n❌ Pipeline Execution Failed.")
+            if e.cmd[0] == 'g++':
+                print(f"Testbench Compiler Error Log:\n{e.stderr}")
+            else:
+                print(f"Runtime/Assertion Error Log:\n{e.stderr}")
 
     except Exception as e:
-        print(f"Pipeline failed: {e}")
+        print(f"\nPipeline critical failure: {e}")
