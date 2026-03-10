@@ -2,6 +2,7 @@ import os
 import json
 import litellm
 import subprocess
+import re
 from litellm import completion
 from litellm.exceptions import RateLimitError, ContextWindowExceededError, APIConnectionError, ServiceUnavailableError, NotFoundError
 from pydantic import BaseModel, Field
@@ -46,7 +47,6 @@ def robust_completion(base_model: str, messages: list, response_format: Type[T])
             _CURRENT_ACTIVE_MODEL = current_model
         # --- INNER LOOP: JSON Retry Logic ---
         for attempt in range(max_attempts):
-            print(f"Model in use ={current_model}.")
             try:
                 response = completion(
                     model=current_model,
@@ -70,12 +70,13 @@ def robust_completion(base_model: str, messages: list, response_format: Type[T])
                 break  # Break inner loop, move to the next fallback model
 
             except Exception as e:
+                last_err = e
                 print(f"  ⚠️ [Attempt {attempt + 1} Failed] JSON/Formatting error on {current_model}. Retrying...")
                 if attempt == max_attempts - 1:
                     print(f"  ❌ Max formatting retries reached on {current_model}.")
                     break  # Crash. Do NOT fallback if the model just can't format JSON.
 
-    raise Exception("❌ All API fallback models exhausted due to Token/Network limits.")
+    raise Exception(f"❌ Pipeline failed, last Error is {last_err}.")
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +167,11 @@ class CirbuildProgressiveCoder:
             "google xls": """
                 1. DO NOT use Xilinx Vitis HLS libraries. NO #include "ap_int.h". NO ap_uint.
                 2. DO NOT use Xilinx pragmas. NO #pragma HLS INTERFACE.
-                3. For Google XLS, you MUST use exactly one pragma: `#pragma hls_top` placed immediately before the top-level evaluation function.
-                4. Use strictly standard C++ libraries like <cstdint> (e.g., uint8_t, uint16_t, bool).
-                5. Always include an explicit active-low reset signal (e.g., rst_n) in the top-level evaluation function parameters and use if (!rst_n) to clear internal states.
+                3. For Google XLS, you MUST use exactly one top-level pragma: `#pragma hls_top` placed immediately before the top-level evaluation function.
+                4. DO NOT use ANY #include directives (NO #include <cstdint>). The compiler environment is stripped. 
+                5. Use native C++ built-in types instead of stdint: use `unsigned char` for 8-bit, `unsigned short` for 16-bit, `unsigned int` for 32-bit, and `bool`.
+                6. Always include an explicit active-low reset signal (e.g., rst_n) in the top-level evaluation function parameters and use if (!rst_n) to clear internal states.
+                7. LOOP UNROLLING: Every single `for` loop MUST be immediately preceded by `#pragma hls_unroll yes` to ensure it is synthesized as combinational logic.
             """,
             "vitis hls": """
                 1. Use standard Xilinx Vitis HLS libraries. You MUST #include "ap_int.h" and use ap_uint/ap_int types.
@@ -203,11 +206,38 @@ class CirbuildProgressiveCoder:
         ]
         
         return robust_completion(self.model, messages, CppHlsTarget)
+    def patch_xls_headers(self, cpp_code: str) -> str:
+        """
+        Hardcodes a bypass for the missing <cstdint> library in Google XLS 
+        by injecting standard typedefs directly into the file.
+        """
+        # 1. Deterministically strip the problematic standard headers
+        cpp_code = cpp_code.replace("#include <cstdint>", "")
+        cpp_code = cpp_code.replace("#include <stdint.h>", "")
+    
+       # 2. Safely replace exact whole words (using \b boundaries)
+       # This prevents accidentally replacing variables like "my_uint8_t_val"
+        replacements = {
+        r'\buint8_t\b': 'unsigned char',
+        r'\buint16_t\b': 'unsigned short',
+        r'\buint32_t\b': 'unsigned int',
+        r'\buint64_t\b': 'unsigned long long',
+        r'\bint8_t\b': 'signed char',
+        r'\bint16_t\b': 'short',
+        r'\bint32_t\b': 'int',
+        r'\bint64_t\b': 'long long'
+        }
+        for pattern, native_type in replacements.items():
+            cpp_code = re.sub(pattern, native_type, cpp_code)
+        
+        return cpp_code.strip()
+        
+    
     
 class CirbuildReflectionAgent:
     def __init__(self, model_name: str = DEFAULT_MODEL):
         self.model = model_name
-
+    
     def mock_compile_check(self, filename: str) -> str:
         """
         In a real lab environment, this would call your HLS compiler (e.g., Vitis HLS).
@@ -229,16 +259,84 @@ class CirbuildReflectionAgent:
             # Return the exact compiler error message
             return e.stderr
 
+    def run_full_xls_pipeline(self, cpp_filename: str, docker_image: str = "cirbuild-xls:v1"):
+        print(f"\n⚙️ Phase 5: Executing Full Google XLS Compilation Pipeline...")
+        
+        # Define the file progression
+        ir_file = cpp_filename.replace(".cpp", ".ir")
+        opt_ir_file = cpp_filename.replace(".cpp", ".opt.ir")
+        v_file = cpp_filename.replace(".cpp", ".v")
+        
+        local_dir = os.getcwd()
+        
+        # The base command spins up the pre-built image in milliseconds
+        base_docker_cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{local_dir}:/workspace",
+            "-w", "/workspace",
+            docker_image
+        ]
+        
+        try:
+            # ---------------------------------------------------------
+            # Step 1: C++ to XLS IR (xlscc)
+            # ---------------------------------------------------------
+            print("   -> Step 1: Converting C++ to XLS IR...")
+            xlscc_cmd = base_docker_cmd + ["/home/xls-developer/.cache/bazel/_bazel_xls-developer/970c5c2433bb6038ab152477a024c421/execroot/_main/bazel-out/k8-opt/bin/xls/contrib/xlscc/xlscc", cpp_filename]
+            xlscc_process = subprocess.run(xlscc_cmd, check=True, capture_output=True, text=True)
+            with open(ir_file, "w") as f:
+                f.write(xlscc_process.stdout)
+            
+            # ---------------------------------------------------------
+            # Step 2: Optimize the IR (opt_main)
+            # ---------------------------------------------------------
+            print("   -> Step 2: Optimizing IR...")
+            opt_cmd = base_docker_cmd + ["/home/xls-developer/.cache/bazel/_bazel_xls-developer/970c5c2433bb6038ab152477a024c421/execroot/_main/bazel-out/k8-opt/bin/xls/tools/opt_main", ir_file]
+            
+            # opt_main outputs to stdout, so we capture it and write to file
+            opt_process = subprocess.run(opt_cmd, check=True, capture_output=True, text=True)
+            with open(opt_ir_file, "w") as f:
+                f.write(opt_process.stdout)
+
+            # ---------------------------------------------------------
+            # Step 3: Generate Verilog (codegen_main)
+            # ---------------------------------------------------------
+            print("   -> Step 3: Generating Synthesizable Verilog...")
+            codegen_cmd = base_docker_cmd + [
+                "/home/xls-developer/.cache/bazel/_bazel_xls-developer/970c5c2433bb6038ab152477a024c421/execroot/_main/bazel-out/k8-opt/bin/xls/tools/codegen_main", opt_ir_file,
+                "--generator", "combinational"
+            ]
+            
+            # codegen_main also outputs to stdout
+            codegen_process = subprocess.run(codegen_cmd, check=True, capture_output=True, text=True)
+            with open(v_file, "w") as f:
+                f.write(codegen_process.stdout)
+
+            print(f"✅ Pipeline Complete! Verilog saved to: {v_file}")
+            return True, v_file
+
+        except subprocess.CalledProcessError as e:
+            print(f"❌ XLS Compilation Failed at step: {' '.join(e.cmd)}")
+            print(f"Error Log:\n{e.stderr}")
+            return False, e.stderr
+
     def fix_compilation_error(self, bad_code: str, error_log: str, target_compiler: str) -> CppCorrection:
         print(f"Reflection Agent triggered: Analyzing compiler errors for [{target_compiler}]...")
         
         compiler_rules = {
             "google xls": """
-                1. DO NOT use Xilinx Vitis HLS libraries (NO ap_int.h). Use standard <cstdint>.
-                2. IMPORTANT: You MUST use exactly one pragma: `#pragma hls_top` before the top-level function.
+                1. DO NOT use Xilinx Vitis HLS libraries. NO #include "ap_int.h". NO ap_uint.
+                2. DO NOT use Xilinx pragmas. NO #pragma HLS INTERFACE.
+                3. For Google XLS, you MUST use exactly one top-level pragma: `#pragma hls_top` placed immediately before the top-level evaluation function.
+                4. DO NOT use ANY #include directives (NO #include <cstdint>). The compiler environment is stripped. 
+                5. Use native C++ built-in types instead of stdint: use `unsigned char` for 8-bit, `unsigned short` for 16-bit, `unsigned int` for 32-bit, and `bool`.
+                6. Always include an explicit active-low reset signal (e.g., rst_n) in the top-level evaluation function parameters and use if (!rst_n) to clear internal states.
+                7. LOOP UNROLLING: Every single `for` loop MUST be immediately preceded by `#pragma hls_unroll yes` to ensure it is synthesized as combinational logic. 
             """,
             "vitis hls": """
                 1. Use standard Xilinx Vitis HLS libraries. You MUST #include "ap_int.h" and use ap_uint/ap_int types.
+                2. Apply appropriate #pragma HLS INTERFACE and #pragma HLS PIPELINE directives.
+                3. Use strictly standard C++ libraries like <cstdint> (e.g., uint8_t, uint16_t, bool).
             """
         }
         
@@ -300,7 +398,7 @@ class CirbuildVerifierAgent:
 
         [HARDWARE INTEGRATION]
         - The hardware module is ALREADY written. Call it using the EXACT function signature provided. 
-        - Do not redefine any hardware logic or classes.
+        - Do not redefine any hardware logic, classes, or structs.
 
         [TESTING STRATEGY]
         - Write ALGORITHMIC testbenches (use `for` loops, boundary checks, edge-case generation). Avoid unrolled, brute-force assert lines.
@@ -402,12 +500,16 @@ if __name__ == "__main__":
         plan = planner_agent.understand_and_plan(sample_spec)
         py_model = coder_agent.generate_python_gold_model(plan)
         cpp_target = coder_agent.generate_hls_cpp(py_model, plan.target_compiler)
+
+        final_cpp_code = cpp_target.cpp_code
+        if "google xls" in plan.target_compiler.lower():
+            final_cpp_code = coder_agent.patch_xls_headers(final_cpp_code)
         
         safe_name = plan.module_name.strip().lower().replace(" ", "_").replace("-", "_")
         output_filename = f"{safe_name}_hls.cpp"
         
         with open(output_filename, "w") as file:
-            file.write(cpp_target.cpp_code.replace('\\n', '\n'))
+            file.write(final_cpp_code.replace('\\n', '\n'))
             
         print(f"\n✅ Phase 1: Initial C++ Code Saved to {output_filename}")
 
@@ -472,6 +574,20 @@ if __name__ == "__main__":
             # 3. Verify the output
             if "TEST PASSED" in run_process.stdout:
                 print("\n🏆 VERIFICATION SUCCESSFUL: The hardware logic is functionally correct!")
+                # ---------------------------------------------------------
+                # Phase 5: Full HLS to Verilog Pipeline
+                # ---------------------------------------------------------
+                # Note: Replace 'your_xls_image_name' with your actual local Docker image tag
+                success, output_info = reflection_agent.run_full_xls_pipeline(
+                    cpp_filename=output_filename, 
+                    docker_image="cirbuild-xls:v1" 
+                )
+            
+                if success:
+                    print(f"\n🎉 EDA Pipeline Complete! Ready for FPGA synthesis.")
+                    print(f"📄 Final RTL: {output_info}")
+                else:
+                    print(f"\n❌ XLS Compiler Pipeline Failed:\n{output_info}")
             else:
                 print("\n❌ VERIFICATION FAILED: The logic did not produce the expected outputs.")
 
