@@ -1,37 +1,44 @@
 #include <cstdint>
 
-class FourTapMovingAverageFilter {
-private:
-    uint8_t tap0;
-    uint8_t tap1;
-    uint8_t tap2;
-    uint8_t tap3;
-    uint8_t data_out_reg;
+struct MovingAverageState {
+    uint8_t taps[4];
+};
 
+class MovingAverageFilter {
 public:
-    FourTapMovingAverageFilter() : tap0(0), tap1(0), tap2(0), tap3(0), data_out_reg(0) {}
+    MovingAverageState state;
 
-    #pragma hls_top
-    uint8_t evaluate(uint8_t data_in, bool rst_n) {
+    MovingAverageFilter() {
+        for (int i = 0; i < 4; ++i) {
+            state.taps[i] = 0;
+        }
+    }
+
+    uint8_t process(uint8_t data_in, bool rst_n) {
         if (!rst_n) {
-            tap0 = 0;
-            tap1 = 0;
-            tap2 = 0;
-            tap3 = 0;
-            data_out_reg = 0;
+            for (int i = 0; i < 4; ++i) {
+                state.taps[i] = 0;
+            }
             return 0;
         }
 
-        tap3 = tap2;
-        tap2 = tap1;
-        tap1 = tap0;
-        tap0 = data_in;
+        state.taps[3] = state.taps[2];
+        state.taps[2] = state.taps[1];
+        state.taps[1] = state.taps[0];
+        state.taps[0] = data_in;
 
-        uint16_t sum_val = static_cast<uint16_t>(tap0) + static_cast<uint16_t>(tap1) +
-                           static_cast<uint16_t>(tap2) + static_cast<uint16_t>(tap3);
+        uint16_t sum_val = 0;
+        for (int i = 0; i < 4; ++i) {
+            sum_val += state.taps[i];
+        }
 
-        data_out_reg = static_cast<uint8_t>(sum_val >> 2);
-
-        return data_out_reg;
+        uint8_t average = (uint8_t)((sum_val >> 2) & 0xFF);
+        return average;
     }
 };
+
+#pragma hls_top
+uint8_t moving_average_filter(uint8_t data_in, bool rst_n) {
+    static MovingAverageFilter filter;
+    return filter.process(data_in, rst_n);
+}

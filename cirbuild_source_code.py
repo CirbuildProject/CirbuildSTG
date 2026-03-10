@@ -3,7 +3,7 @@ import json
 import litellm
 import subprocess
 from litellm import completion
-from litellm.exceptions import RateLimitError, ContextWindowExceededError, APIConnectionError
+from litellm.exceptions import RateLimitError, ContextWindowExceededError, APIConnectionError, ServiceUnavailableError, NotFoundError
 from pydantic import BaseModel, Field
 from typing import TypeVar, Type
 from dotenv import load_dotenv
@@ -11,12 +11,14 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # Global Configuration
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini/gemini-2.5-flash"
+DEFAULT_MODEL = "gemini/gemini-3-flash-preview"
 
 FALLBACK_MODELS = [
-     "groq/llama3-8b-8192", 
-     "openai/gpt-4o-mini"
- ]
+    "gemini/gemini-2.5-flash",       
+    "gemini/gemini-2.5-flash-lite", 
+    "gemini/gemini-2.5-pro"          
+]
+_CURRENT_ACTIVE_MODEL = None
 
 load_dotenv()
 
@@ -33,14 +35,18 @@ def robust_completion(base_model: str, messages: list, response_format: Type[T])
     A global router that handles JSON formatting retries locally, 
     but falls back to different API models if Token/Rate limits are hit.
     """
+    global _CURRENT_ACTIVE_MODEL
     models_to_try = [base_model] + FALLBACK_MODELS
     max_attempts = 3
 
     # --- OUTER LOOP: API Fallback Routing ---
     for current_model in models_to_try:
-        
+        if current_model != _CURRENT_ACTIVE_MODEL:
+            print(f"  🤖 [Model Active] {current_model}")
+            _CURRENT_ACTIVE_MODEL = current_model
         # --- INNER LOOP: JSON Retry Logic ---
         for attempt in range(max_attempts):
+            print(f"Model in use ={current_model}.")
             try:
                 response = completion(
                     model=current_model,
@@ -54,12 +60,20 @@ def robust_completion(base_model: str, messages: list, response_format: Type[T])
             except (RateLimitError, ContextWindowExceededError, APIConnectionError) as e:
                 print(f"  ⚠️ [API Limit] Rate/Token limit hit on {current_model}. Routing to fallback...")
                 break  # Break inner loop, move to the next fallback model
-                
+
+            except (ServiceUnavailableError) as e:
+                print(f"  ⚠️ [Server Down] Server issue on {current_model}. Routing to fallback...")
+                break  # Break inner loop, move to the next fallback model    
+
+            except (NotFoundError) as e:
+                print(f"  Model {current_model} Not Found on LiteLLM. Routing to fallback...")
+                break  # Break inner loop, move to the next fallback model
+
             except Exception as e:
                 print(f"  ⚠️ [Attempt {attempt + 1} Failed] JSON/Formatting error on {current_model}. Retrying...")
                 if attempt == max_attempts - 1:
                     print(f"  ❌ Max formatting retries reached on {current_model}.")
-                    raise e  # Crash. Do NOT fallback if the model just can't format JSON.
+                    break  # Crash. Do NOT fallback if the model just can't format JSON.
 
     raise Exception("❌ All API fallback models exhausted due to Token/Network limits.")
 
@@ -136,6 +150,7 @@ class CirbuildProgressiveCoder:
         CRITICAL STRICT RULES: 
         1. DO NOT include ANY comments (# lines) in the output code. Provide ONLY the raw logic. 
         2. IMPORTANT: You are outputting into a JSON string. You must properly escape all newlines as \\n and avoid using double quotes inside the code (use single quotes instead).
+        3. You MUST strictly adhere to the exact signal names, bit-widths, and data types (signed vs unsigned) specified in the inputs/outputs dictionary.
         """
         messages = [
             {"role": "system", "content": system_prompt.strip()},
@@ -172,6 +187,9 @@ class CirbuildProgressiveCoder:
         {selected_rules}
         - DO NOT include ANY comments (// or /*) in the output code. Provide ONLY the raw logic.
         - IMPORTANT: Output into a JSON string. Escape newlines as \\n and use single quotes inside the code.
+        - You MUST strictly adhere to the exact signal names, bit-widths, and data types (signed vs unsigned) specified in the inputs/outputs dictionary.
+        - Always encapsulate module state (registers/arrays) inside a C++ class or struct. DO NOT use global or static variables for hardware state.
+        - Use C++ templates (e.g., template <int N>) and generic for loops for scalable logic rather than hardcoding arrays and manually unrolling shift registers.
         """
         
         prompt = f"""
@@ -258,7 +276,7 @@ class CirbuildVerifierAgent:
     def __init__(self, model_name: str = DEFAULT_MODEL):
         self.model = model_name
 
-    def generate_cpp_testbench(self, plan: PseudocodePlan, target_compiler: str) -> CppTestbench:
+    def generate_cpp_testbench(self, plan: PseudocodePlan, target_compiler: str, generated_cpp: str) -> CppTestbench:
         print(f"Step 4: Generating C++ Testbench for [{target_compiler}]...")
         
         compiler_rules = {
@@ -279,20 +297,72 @@ class CirbuildVerifierAgent:
         
         CRITICAL STRICT RULES:
         {selected_rules}
-        - The testbench MUST include a main() function.
-        - Instantiate the module, feed it sequential test vectors, and use standard assert() or if-statements to verify the expected outputs.
-        - DO NOT write unrolled, brute-force testbenches (e.g., dozens of manual assert lines). 
-        - Instead, write ALGORITHMIC testbenches. Use `for` loops, mathematical boundary checks, and programmatic edge-case generation 
-          (e.g., testing max/min input values, overflow limits, and reset recovery) to achieve high test coverage with minimal lines of C++ code.
-        - If all tests pass, print "TEST PASSED" and return 0. If they fail, return 1.
-        - DO NOT include ANY comments (// or /*) in the output code. Provide ONLY the raw C++ logic.
-        - IMPORTANT: Output into a JSON string. Escape newlines as \\n and use single quotes inside the code.
+
+        [HARDWARE INTEGRATION]
+        - The hardware module is ALREADY written. Call it using the EXACT function signature provided. 
+        - Do not redefine any hardware logic or classes.
+
+        [TESTING STRATEGY]
+        - Write ALGORITHMIC testbenches (use `for` loops, boundary checks, edge-case generation). Avoid unrolled, brute-force assert lines.
+        - DYNAMIC ASSERTIONS: Compute expected values dynamically at runtime using a software shadow-state (e.g., std::deque). Do not hardcode expected output arrays.
+        - STATE SYNCHRONIZATION: If you assert a hardware reset (!rst_n), you MUST simultaneously clear your shadow-state variables to match.
+        - Always use loops for shift register propagation.
+
+        [FORMATTING & OUTPUT]
+        - Write ONLY the `int main()` function and necessary standard includes.
+        - Provide ONLY raw C++ logic. Zero comments (// or /*) are allowed.
+        - Success/Failure: Print "TEST PASSED" and return 0 on success. Return 1 on failure.
+        - JSON FORMAT: Output as a valid JSON string. Use standard C++ double quotes for literals (e.g., "TEST PASSED") and escape them properly for JSON.
         """
         
         prompt = f"""
         Module Name: {plan.module_name}
         I/O Interface: {plan.inputs_outputs}
         Expected Behavior: {plan.logic_steps}
+
+        Generated C++ Hardware Module (Already Included in environment):
+        {generated_cpp}
+
+        [STRUCTURAL TEMPLATE FOR TESTBENCH]
+        You MUST follow this exact architectural skeleton, but replace the generic types, functions, and logic with the specific requirements of the module described above:
+
+        ```cpp
+        #include <iostream>
+        #include <cassert>
+        // Include any required data structures for the shadow state (e.g., <deque>, <vector>)
+        #include "module.cpp"
+
+        int main() {{
+            // 1. Initialize Software Shadow State
+            <ShadowStateType> shadow_state; 
+            
+            // 2. Hardware Reset & Shadow State Synchronization
+            <module_function_name>(<zero_inputs>, false, ...); 
+            // IMMEDIATELY reset the shadow state to match!
+            shadow_state.clear(); // (or equivalent reset logic)
+
+            // 3. Algorithmic Test Loop (Edge cases, sweeps, or randoms)
+            for (int i = 0; i < <NUM_TESTS>; ++i) {{
+                // a. Generate dynamic test inputs
+                <InputType> current_input = <generated_value>;
+                
+                // b. Update software shadow state
+                <update_shadow_state_logic>;
+                
+                // c. Compute expected output dynamically
+                <OutputType> expected_out = <compute_from_shadow_state>;
+                
+                // d. Evaluate hardware and assert
+                <OutputType> hw_out = <module_function_name>(current_input, true, ...);
+                if (hw_out != expected_out) {{
+                    return 1;
+                }}
+            }}
+            
+            std::cout << "TEST PASSED" << std::endl;
+            return 0;
+        }}
+        ```
         """
         
         messages=[
@@ -319,6 +389,8 @@ if __name__ == "__main__":
     - The filter updates every single clock cycle.
     - It calculates the average of the last 4 inputs.
     """
+
+    planner_agent = CirbuildProgressiveCoder(model_name="gemini/gemini-2.5-flash")
     coder_agent = CirbuildProgressiveCoder(model_name=DEFAULT_MODEL)
     reflection_agent = CirbuildReflectionAgent(model_name=DEFAULT_MODEL)
     verifier_agent = CirbuildVerifierAgent(model_name=DEFAULT_MODEL) 
@@ -327,7 +399,7 @@ if __name__ == "__main__":
         # ---------------------------------------------------------
         # Phase 1: Core Generation
         # ---------------------------------------------------------
-        plan = coder_agent.understand_and_plan(sample_spec)
+        plan = planner_agent.understand_and_plan(sample_spec)
         py_model = coder_agent.generate_python_gold_model(plan)
         cpp_target = coder_agent.generate_hls_cpp(py_model, plan.target_compiler)
         
@@ -359,7 +431,8 @@ if __name__ == "__main__":
         # ---------------------------------------------------------
         # Phase 3: Testbench Generation
         # ---------------------------------------------------------
-        cpp_tb = verifier_agent.generate_cpp_testbench(plan, plan.target_compiler)
+        
+        cpp_tb = verifier_agent.generate_cpp_testbench(plan, plan.target_compiler, cpp_target.cpp_code)
         
         tb_filename = f"{safe_name}_tb.cpp"
         with open(tb_filename, "w") as file:
