@@ -11,5 +11,3 @@ This idea is targeted to:
 2) Solve resource accessibility and guidance problems for students to learn the actual industry-standard IC design workflows.
 3) Explore top-down pedagogical frameworks with LLM assistance to learn-while-building their own IC, and be able to see the layouts themselves. 
 
-
-
