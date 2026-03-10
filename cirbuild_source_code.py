@@ -51,17 +51,36 @@ class CirbuildProgressiveCoder:
     def understand_and_plan(self, spec_text: str) -> PseudocodePlan:
         print(f"Step 1: Translating Spec to Pseudocode using {self.model}...")
         
-        response = completion(
-            model=self.model,
-            max_tokens=4096,
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": "You are an expert hardware architect. Extract the specification into a rigid pseudocode plan. Ensure logical correctness."},
-                {"role": "user", "content": f"Hardware Specification:\n{spec_text}"}
-            ],
-            response_format=PseudocodePlan, # Forces the LLM to return this exact schema
-        )
-        return PseudocodePlan.model_validate_json(response.choices[0].message.content)
+        system_prompt = """
+        You are an expert hardware architect. Extract the specification into a rigid pseudocode plan. 
+        Ensure logical correctness and clear signal definitions.
+        """
+        
+        prompt = f"""
+        Hardware Specification:
+        {spec_text}
+        """
+        
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                response = completion(
+                    model=self.model,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    messages=[
+                        {"role": "system", "content": system_prompt.strip()},
+                        {"role": "user", "content": prompt.strip()}
+                    ],
+                    response_format=PseudocodePlan, 
+                )
+                return PseudocodePlan.model_validate_json(response.choices[0].message.content)
+                
+            except Exception as e:
+                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught. Retrying...")
+                if attempt == max_attempts - 1:
+                    print("  Max retries reached. Pipeline critical failure.")
+                    raise e    
 
     def generate_python_gold_model(self, plan: PseudocodePlan) -> PythonReference:
         print("Step 2: Generating Python Reference Model...")
@@ -108,7 +127,6 @@ class CirbuildProgressiveCoder:
     def generate_hls_cpp(self, py_model: PythonReference, target_compiler: str) -> CppHlsTarget:
         print(f"Step 3: Translating Python to Synthesizable C++ for [{target_compiler}]...")
         
-        # --- GATED PROMPT ROUTER ---
         compiler_rules = {
             "google xls": """
                 1. DO NOT use Xilinx Vitis HLS libraries. NO #include "ap_int.h". NO ap_uint.
@@ -124,7 +142,6 @@ class CirbuildProgressiveCoder:
             """
         }
         
-        # Select the rules (default to Google XLS if the string doesn't explicitly match Vitis)
         selected_rules = compiler_rules["vitis hls"] if "vitis" in target_compiler.lower() else compiler_rules["google xls"]
 
         system_prompt = f"""
@@ -137,22 +154,34 @@ class CirbuildProgressiveCoder:
         - IMPORTANT: Output into a JSON string. Escape newlines as \\n and use single quotes inside the code.
         """
         
-        # ... (rest of the completion call remains the same)
-        response = completion(
-            model=self.model,
-            max_tokens=4096,
-            temperature=0.0,
-            max_retries=3,
-            messages=[
-                {"role": "system", "content": system_prompt.strip()},
-                {"role": "user", "content": f"Python Code:\n{py_model.python_code}"}
-            ],
-            response_format=CppHlsTarget,
-        )
-        return CppHlsTarget.model_validate_json(response.choices[0].message.content)
+        prompt = f"""
+        Python Code:
+        {py_model.python_code}
+        """
+        
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                response = completion(
+                    model=self.model,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    messages=[
+                        {"role": "system", "content": system_prompt.strip()},
+                        {"role": "user", "content": prompt.strip()}
+                    ],
+                    response_format=CppHlsTarget,
+                )
+                return CppHlsTarget.model_validate_json(response.choices[0].message.content)
+                
+            except Exception as e:
+                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught. Retrying...")
+                if attempt == max_attempts - 1:
+                    print("  Max retries reached. Pipeline critical failure.")
+                    raise e
     
 class CirbuildReflectionAgent:
-    def __init__(self, model_name: str = "google/gemini-2.5-flash"):
+    def __init__(self, model_name: str = "gemini/gemini-2.5-flash"):
         self.model = model_name
 
     def mock_compile_check(self, filename: str) -> str:
@@ -176,37 +205,62 @@ class CirbuildReflectionAgent:
             # Return the exact compiler error message
             return e.stderr
 
-    def fix_compilation_error(self, bad_code: str, error_log: str) -> CppCorrection:
-        print("Reflection Agent triggered: Analyzing compiler errors...")
+    def fix_compilation_error(self, bad_code: str, error_log: str, target_compiler: str) -> CppCorrection:
+        print(f"Reflection Agent triggered: Analyzing compiler errors for [{target_compiler}]...")
         
-        prompt = f"""
-        The following C++ HLS code failed to compile.
-        [CODE]
-        {bad_code}
-        [COMPILER ERROR LOG]
-        {error_log}
-        Fix the errors and provide the corrected C++ code. Keep it clean and synthesizable.
-        """
-        system_prompt = """
-        You are an expert Google XLS C++ debugging agent. 
+        compiler_rules = {
+            "google xls": """
+                1. DO NOT use Xilinx Vitis HLS libraries (NO ap_int.h). Use standard <cstdint>.
+                2. IMPORTANT: You MUST use exactly one pragma: `#pragma hls_top` before the top-level function.
+            """,
+            "vitis hls": """
+                1. Use standard Xilinx Vitis HLS libraries. You MUST #include "ap_int.h" and use ap_uint/ap_int types.
+            """
+        }
+        
+        selected_rules = compiler_rules["vitis hls"] if "vitis" in target_compiler.lower() else compiler_rules["google xls"]
+
+        system_prompt = f"""
+        You are an expert {target_compiler} C++ debugging agent. 
+        
         CRITICAL STRICT RULES:
-        1. DO NOT use Xilinx Vitis HLS libraries (NO ap_int.h). Use standard <cstdint>.
-        2. DO NOT include ANY comments. Provide ONLY the raw logic.
-        3. IMPORTANT: Output as a JSON string. Escape newlines as \\n and use single quotes in the code.
+        {selected_rules}
+        - DO NOT include ANY comments. Provide ONLY the raw logic.
+        - IMPORTANT: Output as a JSON string. Escape newlines as \\n and use single quotes in the code.
         """
 
-        response = completion(
-            model=self.model,
-            max_tokens=4096,
-            temperature=0.0,
-            max_retries=3,
-            messages=[
-                {"role": "system", "content": system_prompt.strip()},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=CppCorrection,
-        )
-        return CppCorrection.model_validate_json(response.choices[0].message.content)
+        prompt = f"""
+        The following C++ HLS code failed to compile.
+        
+        [CODE]
+        {bad_code}
+        
+        [COMPILER ERROR LOG]
+        {error_log}
+        
+        Fix the errors and provide the corrected C++ code. Keep it clean and synthesizable.
+        """
+
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                response = completion(
+                    model=self.model,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    messages=[
+                        {"role": "system", "content": system_prompt.strip()},
+                        {"role": "user", "content": prompt.strip()}
+                    ],
+                    response_format=CppCorrection,
+                )
+                return CppCorrection.model_validate_json(response.choices[0].message.content)
+                
+            except Exception as e:
+                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught in Reflection. Retrying...")
+                if attempt == max_attempts - 1:
+                    print("  Max retries reached. Reflection Agent critical failure.")
+                    raise e
 # ---------------------------------------------------------------------------
 # 3. Execution Block
 # ---------------------------------------------------------------------------
@@ -250,10 +304,10 @@ if __name__ == "__main__":
         if compile_status != "SUCCESS":
             print(f"\n❌ Compilation Failed. Passing to Reflection Agent...\nError:\n{compile_status}")
             
-            correction = reflection_agent.fix_compilation_error(cpp_target.cpp_code, compile_status)
+            correction = reflection_agent.fix_compilation_error(cpp_target.cpp_code, compile_status, plan.target_compiler)
             
             with open(output_filename, "w") as file:
-                file.write(correction.fixed_cpp_code)
+                file.write(correction.fixed_cpp_code.replace('\\n', '\n'))
                 
             print(f"\n🔧 Code Fixed! Explanation: {correction.explanation}")
             print("\n--- REVISED C++ HLS CODE ---")
