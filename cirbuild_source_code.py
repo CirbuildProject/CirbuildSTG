@@ -3,7 +3,9 @@ import json
 import litellm
 import subprocess
 from litellm import completion
+from litellm.exceptions import RateLimitError, ContextWindowExceededError, APIConnectionError
 from pydantic import BaseModel, Field
+from typing import TypeVar, Type
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -12,17 +14,54 @@ from dotenv import load_dotenv
 DEFAULT_MODEL = "gemini/gemini-2.5-flash"
 
 FALLBACK_MODELS = [
-    "groq/llama3-8b-8192", 
-    "openai/gpt-4o-mini"
-]
+     "groq/llama3-8b-8192", 
+     "openai/gpt-4o-mini"
+ ]
 
 load_dotenv()
 
 # Enable client-side schema validation to ensure the LLM respects our rigid structures
 litellm.enable_json_schema_validation = True #
 
-# Set your API keys here depending on which model you want to test first
-# os.environ["OPENAI_API_KEY"] = "your_openai_key"
+# Setup for generic type hinting (so your IDE knows which Pydantic model is returning)
+T = TypeVar('T', bound=BaseModel)
+# ---------------------------------------------------------------------------
+# Global Dual-Loop Router for JSON / API troubleshooting
+# ---------------------------------------------------------------------------
+def robust_completion(base_model: str, messages: list, response_format: Type[T]) -> T:
+    """
+    A global router that handles JSON formatting retries locally, 
+    but falls back to different API models if Token/Rate limits are hit.
+    """
+    models_to_try = [base_model] + FALLBACK_MODELS
+    max_attempts = 3
+
+    # --- OUTER LOOP: API Fallback Routing ---
+    for current_model in models_to_try:
+        
+        # --- INNER LOOP: JSON Retry Logic ---
+        for attempt in range(max_attempts):
+            try:
+                response = completion(
+                    model=current_model,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    messages=messages,
+                    response_format=response_format,
+                )
+                return response_format.model_validate_json(response.choices[0].message.content)
+                
+            except (RateLimitError, ContextWindowExceededError, APIConnectionError) as e:
+                print(f"  ⚠️ [API Limit] Rate/Token limit hit on {current_model}. Routing to fallback...")
+                break  # Break inner loop, move to the next fallback model
+                
+            except Exception as e:
+                print(f"  ⚠️ [Attempt {attempt + 1} Failed] JSON/Formatting error on {current_model}. Retrying...")
+                if attempt == max_attempts - 1:
+                    print(f"  ❌ Max formatting retries reached on {current_model}.")
+                    raise e  # Crash. Do NOT fallback if the model just can't format JSON.
+
+    raise Exception("❌ All API fallback models exhausted due to Token/Network limits.")
 
 
 # ---------------------------------------------------------------------------
@@ -74,28 +113,12 @@ class CirbuildProgressiveCoder:
         Hardware Specification:
         {spec_text}
         """
+        messages=[
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
         
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                response = completion(
-                    model=self.model,
-                    fallbacks=FALLBACK_MODELS,
-                    max_tokens=4096,
-                    temperature=0.0,
-                    messages=[
-                        {"role": "system", "content": system_prompt.strip()},
-                        {"role": "user", "content": prompt.strip()}
-                    ],
-                    response_format=PseudocodePlan, 
-                )
-                return PseudocodePlan.model_validate_json(response.choices[0].message.content)
-                
-            except Exception as e:
-                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught. Retrying...")
-                if attempt == max_attempts - 1:
-                    print("  Max retries reached. Pipeline critical failure.")
-                    raise e    
+        return robust_completion(self.model, messages, PseudocodePlan) 
 
     def generate_python_gold_model(self, plan: PseudocodePlan) -> PythonReference:
         print("Step 2: Generating Python Reference Model...")
@@ -114,31 +137,12 @@ class CirbuildProgressiveCoder:
         1. DO NOT include ANY comments (# lines) in the output code. Provide ONLY the raw logic. 
         2. IMPORTANT: You are outputting into a JSON string. You must properly escape all newlines as \\n and avoid using double quotes inside the code (use single quotes instead).
         """
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                response = completion(
-                    model=self.model,
-                    fallbacks=FALLBACK_MODELS,
-                    max_tokens=4096,
-                    temperature=0.0,
-                    messages=[
-                        {
-                            "role": "system", 
-                            "content": system_prompt.strip()
-                        },
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format=PythonReference,
-                )
-                # If this succeeds, it breaks the loop and returns the data
-                return PythonReference.model_validate_json(response.choices[0].message.content)
-                
-            except Exception as e:
-                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught. Retrying...")
-                if attempt == max_attempts - 1:
-                    print("  Max retries reached. Pipeline critical failure.")
-                    raise e # Give up if it fails max_attempts times in a row
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, PythonReference)
 
     def generate_hls_cpp(self, py_model: PythonReference, target_compiler: str) -> CppHlsTarget:
         print(f"Step 3: Translating Python to Synthesizable C++ for [{target_compiler}]...")
@@ -175,27 +179,12 @@ class CirbuildProgressiveCoder:
         {py_model.python_code}
         """
         
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                response = completion(
-                    model=self.model,
-                    fallbacks=FALLBACK_MODELS,
-                    max_tokens=4096,
-                    temperature=0.0,
-                    messages=[
-                        {"role": "system", "content": system_prompt.strip()},
-                        {"role": "user", "content": prompt.strip()}
-                    ],
-                    response_format=CppHlsTarget,
-                )
-                return CppHlsTarget.model_validate_json(response.choices[0].message.content)
-                
-            except Exception as e:
-                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught. Retrying...")
-                if attempt == max_attempts - 1:
-                    print("  Max retries reached. Pipeline critical failure.")
-                    raise e
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, CppHlsTarget)
     
 class CirbuildReflectionAgent:
     def __init__(self, model_name: str = DEFAULT_MODEL):
@@ -258,27 +247,12 @@ class CirbuildReflectionAgent:
         Fix the errors and provide the corrected C++ code. Keep it clean and synthesizable.
         """
 
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                response = completion(
-                    model=self.model,
-                    fallbacks=FALLBACK_MODELS,
-                    max_tokens=4096,
-                    temperature=0.0,
-                    messages=[
-                        {"role": "system", "content": system_prompt.strip()},
-                        {"role": "user", "content": prompt.strip()}
-                    ],
-                    response_format=CppCorrection,
-                )
-                return CppCorrection.model_validate_json(response.choices[0].message.content)
-                
-            except Exception as e:
-                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught in Reflection. Retrying...")
-                if attempt == max_attempts - 1:
-                    print("  Max retries reached. Reflection Agent critical failure.")
-                    raise e
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, CppCorrection)
 
 class CirbuildVerifierAgent:
     def __init__(self, model_name: str = DEFAULT_MODEL):
@@ -307,6 +281,9 @@ class CirbuildVerifierAgent:
         {selected_rules}
         - The testbench MUST include a main() function.
         - Instantiate the module, feed it sequential test vectors, and use standard assert() or if-statements to verify the expected outputs.
+        - DO NOT write unrolled, brute-force testbenches (e.g., dozens of manual assert lines). 
+        - Instead, write ALGORITHMIC testbenches. Use `for` loops, mathematical boundary checks, and programmatic edge-case generation 
+          (e.g., testing max/min input values, overflow limits, and reset recovery) to achieve high test coverage with minimal lines of C++ code.
         - If all tests pass, print "TEST PASSED" and return 0. If they fail, return 1.
         - DO NOT include ANY comments (// or /*) in the output code. Provide ONLY the raw C++ logic.
         - IMPORTANT: Output into a JSON string. Escape newlines as \\n and use single quotes inside the code.
@@ -318,27 +295,11 @@ class CirbuildVerifierAgent:
         Expected Behavior: {plan.logic_steps}
         """
         
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                response = completion(
-                    model=self.model,
-                    fallbacks=FALLBACK_MODELS,
-                    max_tokens=4096,
-                    temperature=0.0,
-                    messages=[
-                        {"role": "system", "content": system_prompt.strip()},
-                        {"role": "user", "content": prompt.strip()}
-                    ],
-                    response_format=CppTestbench,
-                )
-                return CppTestbench.model_validate_json(response.choices[0].message.content)
-                
-            except Exception as e:
-                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught in Verifier. Retrying...")
-                if attempt == max_attempts - 1:
-                    print("  Max retries reached. Verifier Agent critical failure.")
-                    raise e
+        messages=[
+             {"role": "system", "content": system_prompt.strip()},
+             {"role": "user", "content": prompt.strip()}
+        ]
+        return robust_completion(self.model, messages, CppTestbench)
 # ---------------------------------------------------------------------------
 # 3. Execution Block
 # ---------------------------------------------------------------------------
