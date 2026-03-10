@@ -6,6 +6,16 @@ from litellm import completion
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------------------------
+# Global Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL = "gemini/gemini-2.5-flash"
+
+FALLBACK_MODELS = [
+    "groq/llama3-8b-8192", 
+    "openai/gpt-4o-mini"
+]
+
 load_dotenv()
 
 # Enable client-side schema validation to ensure the LLM respects our rigid structures
@@ -40,12 +50,16 @@ class CppCorrection(BaseModel):
     fixed_cpp_code: str = Field(description="The corrected C++ code.")
     explanation: str = Field(description="Brief explanation of what was fixed.")
 
+class CppTestbench(BaseModel):
+    testbench_code: str = Field(description="C++ testbench code containing a main() function to validate the module. Use \\n for newlines.")
+    test_cases_covered: str = Field(description="A brief comma-separated list of the test scenarios covered.")
+
 # ---------------------------------------------------------------------------
 # 2. The Agent Pipeline
 # ---------------------------------------------------------------------------
 
 class CirbuildProgressiveCoder:
-    def __init__(self, model_name: str = "gemini/gemini-2.5-flash"):
+    def __init__(self, model_name: str = DEFAULT_MODEL):
         self.model = model_name
 
     def understand_and_plan(self, spec_text: str) -> PseudocodePlan:
@@ -66,6 +80,7 @@ class CirbuildProgressiveCoder:
             try:
                 response = completion(
                     model=self.model,
+                    fallbacks=FALLBACK_MODELS,
                     max_tokens=4096,
                     temperature=0.0,
                     messages=[
@@ -104,6 +119,7 @@ class CirbuildProgressiveCoder:
             try:
                 response = completion(
                     model=self.model,
+                    fallbacks=FALLBACK_MODELS,
                     max_tokens=4096,
                     temperature=0.0,
                     messages=[
@@ -164,6 +180,7 @@ class CirbuildProgressiveCoder:
             try:
                 response = completion(
                     model=self.model,
+                    fallbacks=FALLBACK_MODELS,
                     max_tokens=4096,
                     temperature=0.0,
                     messages=[
@@ -181,7 +198,7 @@ class CirbuildProgressiveCoder:
                     raise e
     
 class CirbuildReflectionAgent:
-    def __init__(self, model_name: str = "gemini/gemini-2.5-flash"):
+    def __init__(self, model_name: str = DEFAULT_MODEL):
         self.model = model_name
 
     def mock_compile_check(self, filename: str) -> str:
@@ -246,6 +263,7 @@ class CirbuildReflectionAgent:
             try:
                 response = completion(
                     model=self.model,
+                    fallbacks=FALLBACK_MODELS,
                     max_tokens=4096,
                     temperature=0.0,
                     messages=[
@@ -260,6 +278,66 @@ class CirbuildReflectionAgent:
                 print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught in Reflection. Retrying...")
                 if attempt == max_attempts - 1:
                     print("  Max retries reached. Reflection Agent critical failure.")
+                    raise e
+
+class CirbuildVerifierAgent:
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model = model_name
+
+    def generate_cpp_testbench(self, plan: PseudocodePlan, target_compiler: str) -> CppTestbench:
+        print(f"Step 4: Generating C++ Testbench for [{target_compiler}]...")
+        
+        compiler_rules = {
+            "google xls": """
+                1. Use standard C++ types (<cstdint>). DO NOT use Xilinx ap_int.h.
+                2. Assume the module uses an active-low reset (rst_n) if it requires reset logic.
+            """,
+            "vitis hls": """
+                1. Use Xilinx Vitis HLS libraries (#include "ap_int.h").
+            """
+        }
+        
+        selected_rules = compiler_rules["vitis hls"] if "vitis" in target_compiler.lower() else compiler_rules["google xls"]
+
+        system_prompt = f"""
+        You are an expert hardware verification engineer targeting {target_compiler}.
+        Write a C++ testbench for the described hardware module.
+        
+        CRITICAL STRICT RULES:
+        {selected_rules}
+        - The testbench MUST include a main() function.
+        - Instantiate the module, feed it sequential test vectors, and use standard assert() or if-statements to verify the expected outputs.
+        - If all tests pass, print "TEST PASSED" and return 0. If they fail, return 1.
+        - DO NOT include ANY comments (// or /*) in the output code. Provide ONLY the raw C++ logic.
+        - IMPORTANT: Output into a JSON string. Escape newlines as \\n and use single quotes inside the code.
+        """
+        
+        prompt = f"""
+        Module Name: {plan.module_name}
+        I/O Interface: {plan.inputs_outputs}
+        Expected Behavior: {plan.logic_steps}
+        """
+        
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                response = completion(
+                    model=self.model,
+                    fallbacks=FALLBACK_MODELS,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    messages=[
+                        {"role": "system", "content": system_prompt.strip()},
+                        {"role": "user", "content": prompt.strip()}
+                    ],
+                    response_format=CppTestbench,
+                )
+                return CppTestbench.model_validate_json(response.choices[0].message.content)
+                
+            except Exception as e:
+                print(f"  [Attempt {attempt + 1} Failed] JSON formatting error caught in Verifier. Retrying...")
+                if attempt == max_attempts - 1:
+                    print("  Max retries reached. Verifier Agent critical failure.")
                     raise e
 # ---------------------------------------------------------------------------
 # 3. Execution Block
@@ -280,8 +358,9 @@ if __name__ == "__main__":
     - The filter updates every single clock cycle.
     - It calculates the average of the last 4 inputs.
     """
-    coder_agent = CirbuildProgressiveCoder(model_name="gemini/gemini-2.5-flash")
-    reflection_agent = CirbuildReflectionAgent(model_name="gemini/gemini-2.5-flash")
+    coder_agent = CirbuildProgressiveCoder(model_name=DEFAULT_MODEL)
+    reflection_agent = CirbuildReflectionAgent(model_name=DEFAULT_MODEL)
+    verifier_agent = CirbuildVerifierAgent(model_name=DEFAULT_MODEL) 
     
     try:
         # Phase 1: Generation
@@ -289,13 +368,25 @@ if __name__ == "__main__":
         py_model = coder_agent.generate_python_gold_model(plan)
         cpp_target = coder_agent.generate_hls_cpp(py_model, plan.target_compiler)
 
+        # Phase 1.5: Verification Generation (NEW)
+        cpp_tb = verifier_agent.generate_cpp_testbench(plan, plan.target_compiler)
+
         safe_name = plan.module_name.strip().lower().replace(" ", "_").replace("-", "_")
         
+        # Save Cpp 
         output_filename = f"{safe_name}_hls.cpp"
         with open(output_filename, "w") as file:
             file.write(cpp_target.cpp_code.replace('\\n', '\n'))
-            
         print(f"\n✅ Initial C++ Code Saved to {output_filename}")
+
+        # Save Testbench
+        tb_filename = f"{safe_name}_tb.cpp"
+        with open(tb_filename, "w") as file:
+            # We inject an #include to link the testbench to the main module file
+            include_statement = f'#include "{output_filename}"\n\n'
+            file.write(include_statement + cpp_tb.testbench_code.replace('\\n', '\n'))
+        print(f"✅ C++ Testbench Saved to {tb_filename}")
+        print(f"   Test Scenarios Covered: {cpp_tb.test_cases_covered}")
 
         # Phase 2: Reflection
         # (For this to work locally without Vitis, you can manually inject a typo into the file here to test it)
