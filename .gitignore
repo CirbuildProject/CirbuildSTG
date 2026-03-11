@@ -1,2 +1,11 @@
 .env
 cirbuild_env/
+4_tap_moving_average_filter_hls.cpp
+4_tap_moving_average_filter_hls.ir
+4_tap_moving_average_filter_hls.opt.ir
+4_tap_moving_average_filter_hls.v
+4_tap_moving_average_filter_tb_exec
+4_tap_moving_average_filter_tb.cpp
+4_tap_moving_average_filter_hls.cpp
+4_tap_moving_average_filter_tb_exec
+4_tap_moving_average_filter_tb.cpp

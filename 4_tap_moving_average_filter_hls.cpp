@@ -1,44 +1,32 @@
-#include <cstdint>
-
-struct MovingAverageState {
-    uint8_t taps[4];
-};
-
-class MovingAverageFilter {
-public:
-    MovingAverageState state;
-
-    MovingAverageFilter() {
-        for (int i = 0; i < 4; ++i) {
-            state.taps[i] = 0;
-        }
-    }
-
-    uint8_t process(uint8_t data_in, bool rst_n) {
-        if (!rst_n) {
-            for (int i = 0; i < 4; ++i) {
-                state.taps[i] = 0;
-            }
-            return 0;
-        }
-
-        state.taps[3] = state.taps[2];
-        state.taps[2] = state.taps[1];
-        state.taps[1] = state.taps[0];
-        state.taps[0] = data_in;
-
-        uint16_t sum_val = 0;
-        for (int i = 0; i < 4; ++i) {
-            sum_val += state.taps[i];
-        }
-
-        uint8_t average = (uint8_t)((sum_val >> 2) & 0xFF);
-        return average;
-    }
+struct MovingAverageFilter4Tap {
+    unsigned char history[4];
+    unsigned char data_out;
 };
 
 #pragma hls_top
-uint8_t moving_average_filter(uint8_t data_in, bool rst_n) {
-    static MovingAverageFilter filter;
-    return filter.process(data_in, rst_n);
+void moving_average_filter_4tap(unsigned char data_in, bool rst_n, unsigned char &data_out, MovingAverageFilter4Tap &state) {
+    if (!rst_n) {
+        #pragma hls_unroll yes
+        for (int i = 0; i < 4; i++) {
+            state.history[i] = 0;
+        }
+        state.data_out = 0;
+        data_out = 0;
+    } else {
+        #pragma hls_unroll yes
+        for (int i = 3; i > 0; i--) {
+            state.history[i] = state.history[i - 1];
+        }
+        state.history[0] = data_in;
+
+        unsigned int sum_val = 0;
+        #pragma hls_unroll yes
+        for (int i = 0; i < 4; i++) {
+            sum_val += state.history[i];
+        }
+
+        unsigned char avg_val = (unsigned char)((sum_val >> 2) & 0xFF);
+        state.data_out = avg_val;
+        data_out = state.data_out;
+    }
 }
