@@ -87,7 +87,9 @@ def robust_completion(base_model: str, messages: list, response_format: Type[T])
 class PseudocodePlan(BaseModel):
     module_name: str = Field(description="The name of the hardware module.")
     target_compiler: str = Field(description="The target HLS compiler mentioned in the spec (e.g., 'Google XLS', 'Vitis HLS'). If not specified, default to 'Google XLS'.")
+    hardware_classification: str = Field(description="Classify as exactly one: 'COMBINATIONAL', 'SEQUENTIAL_PIPELINE', or 'STATE_MACHINE'.")
     inputs_outputs: dict[str, str] = Field(description="Dictionary of signal names and their widths.")
+    state_elements: list[str] = Field(description="List any required memory elements, registers, or history arrays. Return empty list if purely combinational.")
     logic_steps: str = Field(description="Step-by-step pseudocode logic.")
 
 class PythonReference(BaseModel):
@@ -117,11 +119,15 @@ class CirbuildProgressiveCoder:
         self.model = model_name
 
     def understand_and_plan(self, spec_text: str) -> PseudocodePlan:
-        print(f"Step 1: Translating Spec to Pseudocode using {self.model}...")
+        print(f"Step 1: Translating Spec to Pseudocode...")
         
         system_prompt = """
-        You are an expert hardware architect. Extract the specification into a rigid pseudocode plan. 
+        You are a Senior Hardware Architect. Your job is to extract raw specifications into a rigid architectural plan in pseudocode.
         Ensure logical correctness and clear signal definitions.
+        CRITICAL TASKS:
+        1. Classify the hardware: Is it purely Combinational (math/logic), a Sequential Pipeline (data flows through stages over multiple clocks), or a State Machine (control logic with distinct states)?
+        2. Identify State: Explicitly list any memory, history, or registers required to persist across clock cycles.
+        3. Define exact bit-widths for all I/O interfaces.
         """
         
         prompt = f"""
@@ -147,11 +153,12 @@ class CirbuildProgressiveCoder:
         Logic: {plan.logic_steps}
         """
         system_prompt = """
-        You are a Python hardware modeling expert. Intepret and implement the provided psuedocode plan to functionally and syntatically correct Hardware Python code.
+        You are a bit-accurate Python hardware modeling expert. Intepret and implement the provided psuedocode plan to functionally and syntatically correct Hardware Python code.
         CRITICAL STRICT RULES: 
         1. DO NOT include ANY comments (# lines) in the output code. Provide ONLY the raw logic. 
-        2. IMPORTANT: You are outputting into a JSON string. You must properly escape all newlines as \\n and avoid using double quotes inside the code (use single quotes instead).
+        2. BIT-ACCURACY: You MUST emulate hardware bit-widths using bitwise masking (e.g., `val & 0xFF` for 8-bit, `val & 0xFFFF` for 16-bit) after EVERY mathematical operation to perfectly simulate hardware overflow and truncation.
         3. You MUST strictly adhere to the exact signal names, bit-widths, and data types (signed vs unsigned) specified in the inputs/outputs dictionary.
+        4. IMPORTANT: You are outputting into a JSON string. You must properly escape all newlines as \\n and avoid using double quotes inside the code (use single quotes instead).
         """
         messages = [
             {"role": "system", "content": system_prompt.strip()},
@@ -162,18 +169,27 @@ class CirbuildProgressiveCoder:
 
     def generate_hls_cpp(self, py_model: PythonReference, target_compiler: str) -> CppHlsTarget:
         print(f"Step 3: Translating Python to Synthesizable C++ for [{target_compiler}]...")
-        
+
+        universal_hls_rules = """
+        [UNIVERSAL HLS CONSTRAINTS - APPLY TO ALL COMPILERS]
+        1. NO DYNAMIC MEMORY: You are writing physical silicon. DO NOT use `new`, `malloc`, `std::vector`, or pointers for dynamic allocation. All arrays must have statically known, fixed sizes at compile time.
+        2. STATE ENCAPSULATION: All internal registers, memory, and history must be encapsulated within a `struct` or `class`.
+        3. BIT-ACCURATE TYPES: Use exact-width native types (e.g., `unsigned char`, `unsigned short`). 
+        """
         compiler_rules = {
-            "google xls": """
+            "google xls": f"""
+                {universal_hls_rules}
                 1. DO NOT use Xilinx Vitis HLS libraries. NO #include "ap_int.h". NO ap_uint.
                 2. DO NOT use Xilinx pragmas. NO #pragma HLS INTERFACE.
-                3. For Google XLS, you MUST use exactly one top-level pragma: `#pragma hls_top` placed immediately before the top-level evaluation function.
-                4. DO NOT use ANY #include directives (NO #include <cstdint>). The compiler environment is stripped. 
+                3. COMPILER SPECIFIC: Use exactly one `#pragma hls_top` before the top-level evaluation function.
+                4. NO SYSTEM HEADERS: DO NOT use ANY #include directives (NO #include <cstdint>). The compiler environment is stripped. 
                 5. Use native C++ built-in types instead of stdint: use `unsigned char` for 8-bit, `unsigned short` for 16-bit, `unsigned int` for 32-bit, and `bool`.
                 6. Always include an explicit active-low reset signal (e.g., rst_n) in the top-level evaluation function parameters and use if (!rst_n) to clear internal states.
-                7. LOOP UNROLLING: Every single `for` loop MUST be immediately preceded by `#pragma hls_unroll yes` to ensure it is synthesized as combinational logic.
+                7. LOOP PRAGMAS: If the hardware is COMBINATIONAL or computing datapath math within a single clock cycle, you MUST precede the `for` loop with `#pragma hls_unroll yes`. If the loop represents a sequential process that takes multiple clock cycles, DO NOT unroll it.
+                8. PASS BY REFERENCE: Pass the state struct by reference into the top-level function.
             """,
-            "vitis hls": """
+            "vitis hls": f"""
+                {universal_hls_rules}
                 1. Use standard Xilinx Vitis HLS libraries. You MUST #include "ap_int.h" and use ap_uint/ap_int types.
                 2. Apply appropriate #pragma HLS INTERFACE and #pragma HLS PIPELINE directives.
                 3. Use strictly standard C++ libraries like <cstdint> (e.g., uint8_t, uint16_t, bool).
@@ -193,6 +209,7 @@ class CirbuildProgressiveCoder:
         - You MUST strictly adhere to the exact signal names, bit-widths, and data types (signed vs unsigned) specified in the inputs/outputs dictionary.
         - Always encapsulate module state (registers/arrays) inside a C++ class or struct. DO NOT use global or static variables for hardware state.
         - Use C++ templates (e.g., template <int N>) and generic for loops for scalable logic rather than hardcoding arrays and manually unrolling shift registers.
+        - "HEADER GUARDS: You MUST wrap the entire C++ code in standard include guards (e.g., `#ifndef MODULE_NAME_H`, `#define MODULE_NAME_H`, ... `#endif`) to prevent duplicate definitions during testbench compilation."
         """
         
         prompt = f"""
@@ -397,8 +414,11 @@ class CirbuildVerifierAgent:
         {selected_rules}
 
         [HARDWARE INTEGRATION]
-        - The hardware module is ALREADY written. Call it using the EXACT function signature provided. 
+        - The hardware module is ALREADY included via '#include "{output_filename}"'.
+        - CRITICAL: DO NOT add any other local #include directives (e.g., NO #include "fir_filter.h").
+        - All necessary structs (like FirState) and functions are already available from the primary include. 
         - Do not redefine any hardware logic, classes, or structs.
+        - ONLY include standard libraries (<iostream>, <deque>, etc.).
 
         [TESTING STRATEGY]
         - Write ALGORITHMIC testbenches (use `for` loops, boundary checks, edge-case generation). Avoid unrolled, brute-force assert lines.
@@ -441,17 +461,10 @@ class CirbuildVerifierAgent:
 
             // 3. Algorithmic Test Loop (Edge cases, sweeps, or randoms)
             for (int i = 0; i < <NUM_TESTS>; ++i) {{
-                // a. Generate dynamic test inputs
-                <InputType> current_input = <generated_value>;
-                
+                // a. Generate bounded dynamic test inputs (e.g., modulo the max bit-width)
                 // b. Update software shadow state
-                <update_shadow_state_logic>;
-                
-                // c. Compute expected output dynamically
-                <OutputType> expected_out = <compute_from_shadow_state>;
-                
+                // c. Compute expected output dynamically from the shadow state
                 // d. Evaluate hardware and assert
-                <OutputType> hw_out = <module_function_name>(current_input, true, ...);
                 if (hw_out != expected_out) {{
                     return 1;
                 }}
