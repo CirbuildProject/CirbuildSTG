@@ -2,3 +2,6 @@
 cirbuild_env/
 Test output Verilog (monolith)/
 Test_output_C++ (monolith)/
+
+# Archived ideation phase work
+cirbuild_source_code.py
