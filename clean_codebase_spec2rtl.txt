@@ -1,0 +1,3004 @@
+
+
+=== FILE: ./cirbuild/pipeline/json_spec.py ===
+"""JSON specification schema for the Cirbuild agent → spec2rtl bridge.
+
+Validates structured hardware specifications before they are passed
+to the spec2rtl pipeline backend.
+"""
+
+from typing import Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class JsonHardwareSpec(BaseModel):
+    """Validated JSON schema for hardware specification input.
+
+    This model enforces structure on the JSON that the Cirbuild agent
+    produces before it is converted to text for the spec2rtl pipeline.
+    """
+
+    module_name: str = Field(
+        description="Top-level hardware module name (e.g., 'ALU', 'FIFO').",
+    )
+    description: str = Field(
+        description="Natural-language description of the module's purpose and behavior.",
+    )
+    inputs: Dict[str, str] = Field(
+        description="Input signal names mapped to their type/width descriptions.",
+    )
+    outputs: Dict[str, str] = Field(
+        description="Output signal names mapped to their type/width descriptions.",
+    )
+    behavior: str = Field(
+        description="Detailed behavioral specification of the module.",
+    )
+    constraints: List[str] = Field(
+        default_factory=list,
+        description="Design constraints (timing, area, synthesis).",
+    )
+    classification: str = Field(
+        default="COMBINATIONAL",
+        description="Hardware classification: COMBINATIONAL, SEQUENTIAL_PIPELINE, or STATE_MACHINE.",
+        pattern="^(COMBINATIONAL|SEQUENTIAL_PIPELINE|STATE_MACHINE)$",
+    )
+
+
+=== FILE: ./cirbuild/pipeline/__init__.py ===
+"""Cirbuild pipeline integration package."""
+
+from cirbuild.pipeline.bridge import Spec2RTLBridge, PipelineArtifacts
+from cirbuild.pipeline.json_spec import JsonHardwareSpec
+
+__all__ = ["Spec2RTLBridge", "PipelineArtifacts", "JsonHardwareSpec"]
+
+
+=== FILE: ./cirbuild/pipeline/bridge.py ===
+"""Bridge between the Cirbuild agent and the spec2rtl pipeline backend.
+
+Validates inputs, invokes the pipeline, and captures intermediate
+artifacts (spec text, pseudocode, RTL) for the RAG memory store.
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Optional
+
+from cirbuild.config.settings import CirbuildSettings
+from cirbuild.pipeline.json_spec import JsonHardwareSpec
+
+logger = logging.getLogger("cirbuild.pipeline.bridge")
+
+
+def _json_to_spec_text(spec_json: dict) -> str:
+    """Convert a JSON spec dict into a natural-language spec string.
+
+    Local copy to avoid depending on Spec2RTLPipeline's private API.
+    """
+    parts = []
+    parts.append(f"Module Name: {spec_json.get('module_name', 'Unknown')}")
+    parts.append(f"\nDescription:\n{spec_json.get('description', '')}")
+
+    if inputs := spec_json.get("inputs"):
+        parts.append("\nInputs:")
+        for name, desc in inputs.items():
+            parts.append(f"  - {name}: {desc}")
+
+    if outputs := spec_json.get("outputs"):
+        parts.append("\nOutputs:")
+        for name, desc in outputs.items():
+            parts.append(f"  - {name}: {desc}")
+
+    if behavior := spec_json.get("behavior"):
+        parts.append(f"\nBehavior:\n{behavior}")
+
+    if constraints := spec_json.get("constraints"):
+        parts.append("\nConstraints:")
+        for c in constraints:
+            parts.append(f"  - {c}")
+
+    if classification := spec_json.get("classification"):
+        parts.append(f"\nHardware Classification: {classification}")
+
+    return "\n".join(parts)
+
+
+class PipelineArtifacts:
+    """Container for intermediate pipeline artifacts captured for RAG."""
+
+    def __init__(self) -> None:
+        self.spec_text: str = ""
+        self.module_name: str = ""
+        self.classification: str = ""
+        self.pseudocode: str = ""
+        self.final_cpp: str = ""
+        self.rtl_code: str = ""
+        self.rtl_path: Optional[str] = None
+        self.success: bool = False
+        self.error_log: Optional[str] = None
+
+
+class Spec2RTLBridge:
+    """Bridge for invoking the spec2rtl pipeline from the Cirbuild agent.
+
+    Handles input validation, pipeline execution, and artifact capture.
+    The spec2rtl pipeline uses its own LLM configuration internally —
+    this bridge does NOT share the agent's LLM channel.
+
+    Args:
+        settings: CirbuildSTG settings.
+    """
+
+    def __init__(self, settings: CirbuildSettings | None = None) -> None:
+        self._settings = settings or CirbuildSettings.from_yaml()
+        self._pipeline = None  # Lazy init
+
+    def _get_pipeline(self):
+        """Lazily initialize the spec2rtl pipeline."""
+        if self._pipeline is None:
+            from spec2rtl.pipeline import Spec2RTLPipeline
+            self._pipeline = Spec2RTLPipeline(
+                config_path=self._settings.spec2rtl_config_path
+            )
+        return self._pipeline
+
+    def run_from_json(
+        self,
+        spec_json: dict,
+        target_compiler: str | None = None,
+    ) -> PipelineArtifacts:
+        """Validate and run the pipeline from a JSON spec.
+
+        Args:
+            spec_json: Raw JSON dict from the agent.
+            target_compiler: Override compiler setting.
+
+        Returns:
+            PipelineArtifacts with captured intermediate data.
+        """
+        # Validate with Pydantic schema
+        validated = JsonHardwareSpec.model_validate(spec_json)
+        logger.info("✅ JSON spec validated: %s", validated.module_name)
+
+        artifacts = PipelineArtifacts()
+        artifacts.module_name = validated.module_name
+        artifacts.classification = validated.classification
+
+        # Convert to text for artifact storage
+        artifacts.spec_text = _json_to_spec_text(spec_json)
+
+        # Run the pipeline
+        pipeline = self._get_pipeline()
+        result = pipeline.run_from_json(spec_json, target_compiler)
+
+        artifacts.success = result.success
+        artifacts.rtl_path = result.rtl_output_path
+        artifacts.error_log = result.error_log
+
+        # Capture RTL output if successful
+        if result.success and result.rtl_output_path:
+            rtl_path = Path(result.rtl_output_path)
+            if rtl_path.exists():
+                artifacts.rtl_code = rtl_path.read_text(encoding="utf-8")
+
+        return artifacts
+
+    def run_from_file(
+        self,
+        file_path: Path,
+        target_compiler: str | None = None,
+    ) -> PipelineArtifacts:
+        """Run the pipeline from a file (PDF, TXT, or JSON).
+
+        Args:
+            file_path: Path to the specification file.
+            target_compiler: Override compiler setting.
+
+        Returns:
+            PipelineArtifacts with captured intermediate data.
+        """
+        artifacts = PipelineArtifacts()
+        pipeline = self._get_pipeline()
+
+        suffix = file_path.suffix.lower()
+
+        if suffix == ".json":
+            spec_json = json.loads(file_path.read_text(encoding="utf-8"))
+            return self.run_from_json(spec_json, target_compiler)
+
+        elif suffix == ".txt":
+            spec_text = file_path.read_text(encoding="utf-8")
+            artifacts.spec_text = spec_text
+            result = pipeline.run_from_text(spec_text, target_compiler)
+
+        elif suffix == ".pdf":
+            artifacts.spec_text = f"[PDF file: {file_path.name}]"
+            result = pipeline.run(file_path, target_compiler)
+
+        else:
+            raise ValueError(
+                f"Unsupported file format: {suffix}. "
+                "Supported: .json, .txt, .pdf"
+            )
+
+        artifacts.success = result.success
+        artifacts.rtl_path = result.rtl_output_path
+        artifacts.error_log = result.error_log
+
+        if result.success and result.rtl_output_path:
+            rtl_path = Path(result.rtl_output_path)
+            if rtl_path.exists():
+                artifacts.rtl_code = rtl_path.read_text(encoding="utf-8")
+
+        return artifacts
+
+    def run_from_text(
+        self,
+        spec_text: str,
+        target_compiler: str | None = None,
+    ) -> PipelineArtifacts:
+        """Run the pipeline from raw text (e.g., from chat input).
+
+        Args:
+            spec_text: Raw specification text.
+            target_compiler: Override compiler setting.
+
+        Returns:
+            PipelineArtifacts with captured intermediate data.
+        """
+        artifacts = PipelineArtifacts()
+        artifacts.spec_text = spec_text
+
+        pipeline = self._get_pipeline()
+        result = pipeline.run_from_text(spec_text, target_compiler)
+
+        artifacts.success = result.success
+        artifacts.rtl_path = result.rtl_output_path
+        artifacts.error_log = result.error_log
+
+        if result.success and result.rtl_output_path:
+            rtl_path = Path(result.rtl_output_path)
+            if rtl_path.exists():
+                artifacts.rtl_code = rtl_path.read_text(encoding="utf-8")
+
+        return artifacts
+
+
+=== FILE: ./cirbuild/librelane/runner.py ===
+"""Librelane RTL-to-GDSII flow runner for the Cirbuild agent.
+
+Generates configuration, invokes the librelane flow as a subprocess,
+and parses results. Replaces the stub in spec2rtl/librelane/.
+"""
+
+import logging
+import subprocess
+import sys
+import yaml
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from cirbuild.config.settings import CirbuildSettings
+
+logger = logging.getLogger("cirbuild.librelane")
+
+
+class LibrelaneRunner:
+    """Runner for the Librelane RTL-to-GDSII physical design flow.
+
+    Manages design directories, generates configuration files, and
+    invokes the librelane flow as a subprocess.
+
+    Args:
+        settings: CirbuildSTG settings.
+    """
+
+    def __init__(self, settings: CirbuildSettings | None = None) -> None:
+        self._settings = settings or CirbuildSettings.from_yaml()
+        self._librelane_path = Path(self._settings.librelane_repo_path).resolve()
+
+    def generate_config(
+        self,
+        design_dir: Path,
+        module_name: str,
+        clock_port: str = "clk",
+        clock_period: float = 10.0,
+        extra_config: Dict[str, Any] | None = None,
+    ) -> Path:
+        """Generate a librelane config.yaml for the design.
+
+        Creates a minimal but functional config based on the librelane
+        SPM example format.
+
+        Args:
+            design_dir: Path to the design directory (must contain src/*.v).
+            module_name: Top-level module name (DESIGN_NAME).
+            clock_port: Clock port name. Defaults to 'clk'.
+            clock_period: Target clock period in ns. Defaults to 10.
+            extra_config: Additional config overrides.
+
+        Returns:
+            Path to the generated config.yaml.
+        """
+        config: Dict[str, Any] = {
+            "DESIGN_NAME": module_name,
+            "VERILOG_FILES": "dir::src/*.v",
+            "CLOCK_PERIOD": clock_period,
+            "CLOCK_PORT": clock_port,
+        }
+
+        # Add PDK-specific defaults
+        pdk = self._settings.librelane_pdk
+        if pdk.startswith("sky130"):
+            config["pdk::sky130*"] = {
+                "FP_CORE_UTIL": 45,
+                "CLOCK_PERIOD": clock_period,
+            }
+        elif pdk.startswith("gf180"):
+            config["pdk::gf180mcu*"] = {
+                "FP_CORE_UTIL": 40,
+                "CLOCK_PERIOD": clock_period,
+                "MAX_FANOUT_CONSTRAINT": 4,
+                "PL_TARGET_DENSITY": 0.5,
+            }
+
+        # Apply extra overrides
+        if extra_config:
+            config.update(extra_config)
+
+        config_path = design_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+        logger.info("Generated librelane config: %s", config_path)
+        return config_path
+
+    def check_existing_runs(self, design_dir: Path) -> List[Dict[str, Any]]:
+        """Check for existing librelane runs in the design directory.
+
+        Implements the "checkpoint" feature — allows the agent to detect
+        previous runs and offer to show results instead of re-running.
+
+        Args:
+            design_dir: Path to the design directory.
+
+        Returns:
+            List of dicts with run info (tag, path, timestamp).
+        """
+        runs_dir = design_dir / "runs"
+        if not runs_dir.exists():
+            return []
+
+        runs: List[Dict[str, Any]] = []
+        for run_dir in sorted(runs_dir.iterdir()):
+            if run_dir.is_dir():
+                # Try to get modification time
+                try:
+                    mtime = datetime.fromtimestamp(run_dir.stat().st_mtime)
+                    timestamp = mtime.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    timestamp = "unknown"
+
+                run_info: Dict[str, Any] = {
+                    "tag": run_dir.name,
+                    "path": str(run_dir),
+                    "timestamp": timestamp,
+                }
+
+                # Check for key output files
+                for pattern in ["*.gds", "*.def", "*.v", "*final*"]:
+                    found = list(run_dir.rglob(pattern))
+                    if found:
+                        run_info[f"has_{pattern.replace('*', '')}"] = True
+
+                runs.append(run_info)
+
+        return runs
+
+    def run_flow(
+        self,
+        design_dir: Path,
+        config_path: Path | None = None,
+        tag: str | None = None,
+        frm: str | None = None,
+        to: str | None = None,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Execute the librelane physical design flow.
+
+        Invokes ``python -m librelane`` as a subprocess with the
+        appropriate arguments.
+
+        Args:
+            design_dir: Path to the design directory.
+            config_path: Path to config.yaml. Auto-detected if None.
+            tag: Run tag name. Auto-generated if None.
+            frm: Start from this step (e.g., 'Synthesis').
+            to: Stop after this step (e.g., 'Floorplan').
+            overwrite: Whether to overwrite existing runs with same tag.
+
+        Returns:
+            Dict with run results including success status, paths, and logs.
+        """
+        if config_path is None:
+            config_path = design_dir / "config.yaml"
+
+        if not config_path.exists():
+            return {
+                "success": False,
+                "error": f"Config file not found: {config_path}. Run package_for_librelane first.",
+            }
+
+        # Build command
+        cmd = [
+            sys.executable, "-m", "librelane",
+            "--pdk-root", str(Path(self._settings.librelane_pdk_root).expanduser()),
+            "--pdk", self._settings.librelane_pdk,
+        ]
+
+        if tag:
+            cmd.extend(["--tag", tag])
+        if frm:
+            cmd.extend(["--frm", frm])
+        if to:
+            cmd.extend(["--to", to])
+        if overwrite:
+            cmd.append("--overwrite")
+
+        cmd.append(str(config_path))
+
+        logger.info("Running librelane: %s", " ".join(cmd))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(design_dir),
+                timeout=3600,  # 1 hour timeout
+            )
+
+            output: Dict[str, Any] = {
+                "success": result.returncode == 0,
+                "return_code": result.returncode,
+                "stdout_tail": result.stdout[-2000:] if result.stdout else "",
+                "stderr_tail": result.stderr[-2000:] if result.stderr else "",
+                "design_dir": str(design_dir),
+            }
+
+            if result.returncode == 0:
+                logger.info("✅ Librelane flow completed successfully")
+                # Try to find the latest run directory
+                runs = self.check_existing_runs(design_dir)
+                if runs:
+                    output["latest_run"] = runs[-1]
+            else:
+                logger.error("❌ Librelane flow failed (exit code %d)", result.returncode)
+                output["error"] = f"Flow failed with exit code {result.returncode}"
+
+            return output
+
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "error": "Librelane flow timed out after 1 hour.",
+            }
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "error": (
+                    "Could not find Python or librelane. "
+                    f"Ensure librelane is installed and accessible. "
+                    f"Repo path: {self._librelane_path}"
+                ),
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"Unexpected error: {str(exc)}",
+            }
+
+    def parse_run_results(self, run_dir: Path) -> Dict[str, Any]:
+        """Parse results from a completed librelane run.
+
+        Looks for key output files and extracts PPA metrics
+        from report files.
+
+        Args:
+            run_dir: Path to a specific run directory.
+
+        Returns:
+            Dict with parsed results (area, timing, power, output files).
+        """
+        results: Dict[str, Any] = {
+            "run_dir": str(run_dir),
+            "outputs": {},
+            "metrics": {},
+        }
+
+        if not run_dir.exists():
+            results["error"] = f"Run directory not found: {run_dir}"
+            return results
+
+        # Look for key output files
+        output_patterns = {
+            "gds": "**/*.gds",
+            "def": "**/*final*.def",
+            "netlist": "**/*final*.nl.v",
+            "sdc": "**/*.sdc",
+            "spef": "**/*.spef",
+        }
+
+        for name, pattern in output_patterns.items():
+            found = list(run_dir.glob(pattern))
+            if found:
+                results["outputs"][name] = [str(f) for f in found]
+
+        # Try to parse timing/area reports
+        report_patterns = [
+            "**/*sta*summary*",
+            "**/*area*",
+            "**/*power*",
+            "**/*metrics*",
+        ]
+
+        for pattern in report_patterns:
+            for report_file in run_dir.glob(pattern):
+                try:
+                    content = report_file.read_text(encoding="utf-8", errors="ignore")
+                    results["metrics"][report_file.name] = content[:1000]
+                except Exception:
+                    pass
+
+        return results
+
+
+=== FILE: ./cirbuild/librelane/__init__.py ===
+"""Cirbuild Librelane integration package."""
+
+from cirbuild.librelane.runner import LibrelaneRunner
+
+__all__ = ["LibrelaneRunner"]
+
+
+=== FILE: ./cirbuild/agent/tools.py ===
+"""Tool definitions and handlers for the Cirbuild agent.
+
+Each tool is defined in OpenAI function-calling format and has
+a corresponding handler function. Memory (RAG), workspace, and
+librelane tools are wired to real implementations.
+"""
+
+from __future__ import annotations
+import os
+import json
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+from cirbuild.config.settings import CirbuildSettings
+
+if TYPE_CHECKING:
+    from cirbuild.librelane.runner import LibrelaneRunner
+    from cirbuild.memory.rag_store import RAGStore
+    from cirbuild.workspace.manager import WorkspaceManager
+
+logger = logging.getLogger("cirbuild.agent.tools")
+
+
+def _resolve_api_key(model: str) -> str | None:
+    """Resolve the correct API key for a given model string.
+
+    Inspects the model prefix to select the appropriate provider key
+    from the environment. Mirrors the logic in CirbuildAgent._resolve_api_key
+    so that tool handlers use the same provider-specific key routing.
+
+    Key environment variables (set in .env):
+        CIRBUILD_OPENROUTER_KEY  — for ``openrouter/`` models
+        CIRBUILD_GEMINI_KEY      — for ``gemini/`` models
+        CIRBUILD_ANTHROPIC_KEY   — for ``anthropic/`` models
+
+    Args:
+        model: LiteLLM model string (e.g. ``openrouter/minimax/minimax-m2.5``).
+
+    Returns:
+        The resolved API key string, or None if no matching key is set.
+    """
+    if model.startswith("gemini/"):
+        return os.environ.get("CIRBUILD_GEMINI_KEY")
+    if model.startswith("anthropic/"):
+        return os.environ.get("CIRBUILD_ANTHROPIC_KEY")
+    if model.startswith("openrouter/"):
+        return os.environ.get("CIRBUILD_OPENROUTER_KEY")
+    # Unknown provider prefix — let LiteLLM fall back to its own env detection
+    return None
+
+
+def get_tool_definitions() -> List[dict]:
+    """Return all tool definitions in OpenAI function-calling format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "parse_spec_to_json",
+                "description": (
+                    "Parse a natural-language hardware specification into a structured "
+                    "JSON object compatible with the Spec2RTL pipeline. Use this when "
+                    "the user describes a hardware module in conversation."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "spec_description": {
+                            "type": "string",
+                            "description": "The user's natural-language hardware specification.",
+                        }
+                    },
+                    "required": ["spec_description"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_spec2rtl_pipeline",
+                "description": (
+                    "Execute the Spec2RTL pipeline with a JSON specification to generate "
+                    "RTL (Verilog) code. The JSON must conform to the JsonHardwareSpec schema."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "spec_json": {
+                            "type": "object",
+                            "description": (
+                                "Structured hardware spec with module_name, description, "
+                                "inputs, outputs, behavior, constraints, classification."
+                            ),
+                        },
+                        "target_compiler": {
+                            "type": "string",
+                            "description": "Target HLS compiler. Defaults to 'Google XLS'.",
+                        },
+                    },
+                    "required": ["spec_json"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_spec2rtl_from_file",
+                "description": (
+                    "Execute the Spec2RTL pipeline from a specification file. "
+                    "Supports PDF, TXT, and JSON file formats."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the specification file.",
+                        },
+                        "target_compiler": {
+                            "type": "string",
+                            "description": "Target HLS compiler. Defaults to 'Google XLS'.",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_memory",
+                "description": (
+                    "Query the short-term memory store for information about the current "
+                    "design session. Can retrieve spec details, pseudocode plans, or RTL code."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query.",
+                        },
+                        "namespace": {
+                            "type": "string",
+                            "enum": ["spec", "pseudocode", "rtl", "all"],
+                            "description": "Which memory namespace to search.",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_workspace_file",
+                "description": "Read the contents of a file from the Verilog workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {
+                            "type": "string",
+                            "description": "Name of the file to read.",
+                        },
+                    },
+                    "required": ["filename"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_workspace_file",
+                "description": (
+                    "Write or update a Verilog/SystemVerilog file in the workspace. "
+                    "A history snapshot is saved automatically."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {
+                            "type": "string",
+                            "description": "Name of the file to write.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The full file content to write.",
+                        },
+                    },
+                    "required": ["filename", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_workspace_files",
+                "description": "List all files in the current Verilog workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "package_for_librelane",
+                "description": (
+                    "Package the workspace Verilog files into a librelane-compatible "
+                    "design directory with generated configuration."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "module_name": {
+                            "type": "string",
+                            "description": "Top-level module name for librelane config.",
+                        },
+                        "clock_port": {
+                            "type": "string",
+                            "description": "Clock port name. Defaults to 'clk'.",
+                        },
+                        "clock_period": {
+                            "type": "number",
+                            "description": "Target clock period in ns. Defaults to 10.",
+                        },
+                    },
+                    "required": ["module_name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_librelane_flow",
+                "description": (
+                    "Execute the Librelane RTL-to-GDSII physical design flow on the "
+                    "packaged design. Returns PPA (Power, Performance, Area) metrics."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "module_name": {
+                            "type": "string",
+                            "description": "Module name (must match a packaged design).",
+                        },
+                    },
+                    "required": ["module_name"],
+                },
+            },
+        },
+    ]
+
+
+def get_tool_handlers(
+    settings: CirbuildSettings,
+    rag_store: RAGStore | None = None,
+    workspace_manager: WorkspaceManager | None = None,
+    librelane_runner: LibrelaneRunner | None = None,
+) -> Dict[str, Callable]:
+    """Return a mapping of tool names to their handler functions.
+
+    Args:
+        settings: CirbuildSTG settings for configuring handlers.
+        rag_store: Optional RAGStore instance. Creates a default if None.
+        workspace_manager: Optional WorkspaceManager instance. Creates a
+            default if None.
+        librelane_runner: Optional LibrelaneRunner instance. Creates a
+            default if None.
+
+    Returns:
+        Dict mapping tool name strings to callable handlers.
+    """
+    from cirbuild.librelane.runner import LibrelaneRunner as _LibrelaneRunner
+    from cirbuild.memory.rag_store import RAGStore as _RAGStore
+    from cirbuild.pipeline.bridge import Spec2RTLBridge
+    from cirbuild.workspace.manager import WorkspaceManager as _WorkspaceManager
+
+    bridge = Spec2RTLBridge(settings)
+    store = rag_store or _RAGStore()
+    workspace = workspace_manager or _WorkspaceManager(settings.workspace_dir)
+    runner = librelane_runner or _LibrelaneRunner(settings)
+
+    # ------------------------------------------------------------------
+    # Spec parsing
+    # ------------------------------------------------------------------
+
+    def handle_parse_spec_to_json(spec_description: str) -> dict:
+        """Use the agent's LLM to parse natural language into JSON spec."""
+        from litellm import completion as llm_completion
+
+        from cirbuild.pipeline.json_spec import JsonHardwareSpec
+
+        parse_prompt = (
+            "Convert the following hardware specification description into a JSON object "
+            "with exactly these fields:\n"
+            "- module_name (string): The hardware module name\n"
+            "- description (string): Brief description of the module\n"
+            "- inputs (object): Input signal names mapped to type/width descriptions\n"
+            "- outputs (object): Output signal names mapped to type/width descriptions\n"
+            "- behavior (string): Detailed behavioral specification\n"
+            "- constraints (array of strings): Design constraints\n"
+            "- classification (string): One of COMBINATIONAL, SEQUENTIAL_PIPELINE, STATE_MACHINE\n\n"
+            "Output ONLY valid JSON, no markdown fences or extra text.\n\n"
+            f"Specification:\n{spec_description}"
+        )
+
+        try:
+            response = llm_completion(
+                model=settings.agent_model,
+                api_key=_resolve_api_key(settings.agent_model),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a hardware specification parser. Output only valid JSON.",
+                    },
+                    {"role": "user", "content": parse_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=2048,
+                # Do NOT pass response_format — not all providers support it
+            )
+            content = response.choices[0].message.content
+            # Strip markdown fences if present
+            if content.strip().startswith("```"):
+                content = content.strip()
+                content = content.split("\n", 1)[1] if "\n" in content else content
+                if content.endswith("```"):
+                    content = content[:-3]
+            spec_json = json.loads(content)
+            # Validate with Pydantic
+            validated = JsonHardwareSpec.model_validate(spec_json)
+            return {"success": True, "spec_json": validated.model_dump()}
+        except Exception as exc:
+            logger.error("Failed to parse spec: %s", exc)
+            return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Pipeline execution (with auto-store to RAG + auto-init workspace)
+    # ------------------------------------------------------------------
+
+    def handle_run_spec2rtl_pipeline(
+        spec_json: dict,
+        target_compiler: str | None = None,
+    ) -> dict:
+        """Run the spec2rtl pipeline with a JSON spec.
+
+        On success, automatically stores artifacts in the RAG memory
+        store and initializes the workspace from the synthesis result.
+        """
+        try:
+            artifacts = bridge.run_from_json(spec_json, target_compiler)
+            # Auto-store in RAG and auto-init workspace on success
+            if artifacts.success:
+                store.store_pipeline_artifacts(artifacts)
+                if artifacts.rtl_path:
+                    workspace.init_from_synthesis(
+                        artifacts.rtl_path, artifacts.module_name
+                    )
+            return {
+                "success": artifacts.success,
+                "module_name": artifacts.module_name,
+                "rtl_path": artifacts.rtl_path,
+                "error": artifacts.error_log,
+                "rtl_preview": (
+                    artifacts.rtl_code[:500] if artifacts.rtl_code else None
+                ),
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def handle_run_spec2rtl_from_file(
+        file_path: str,
+        target_compiler: str | None = None,
+    ) -> dict:
+        """Run the spec2rtl pipeline from a file.
+
+        On success, automatically stores artifacts in the RAG memory
+        store and initializes the workspace from the synthesis result.
+        """
+        try:
+            artifacts = bridge.run_from_file(Path(file_path), target_compiler)
+            # Auto-store in RAG and auto-init workspace on success
+            if artifacts.success:
+                store.store_pipeline_artifacts(artifacts)
+                if artifacts.rtl_path:
+                    workspace.init_from_synthesis(
+                        artifacts.rtl_path, artifacts.module_name
+                    )
+            return {
+                "success": artifacts.success,
+                "module_name": artifacts.module_name,
+                "rtl_path": artifacts.rtl_path,
+                "error": artifacts.error_log,
+                "rtl_preview": (
+                    artifacts.rtl_code[:500] if artifacts.rtl_code else None
+                ),
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # RAG memory query
+    # ------------------------------------------------------------------
+
+    def handle_query_memory(query: str, namespace: str = "all") -> dict:
+        """Query the BM25 RAG memory store for relevant chunks."""
+        results = store.query(query, namespace=namespace, top_k=5)
+        if not results:
+            return {"results": [], "message": "No relevant results found."}
+        return {
+            "results": [
+                {
+                    "score": round(score, 3),
+                    "namespace": chunk.namespace,
+                    "text": chunk.text[:300],
+                    "metadata": chunk.metadata,
+                }
+                for score, chunk in results
+            ]
+        }
+
+    # ------------------------------------------------------------------
+    # Workspace file operations
+    # ------------------------------------------------------------------
+
+    def handle_read_workspace_file(filename: str) -> dict:
+        """Read a file from the active Verilog workspace."""
+        try:
+            content = workspace.read_file(filename)
+            return {"filename": filename, "content": content}
+        except (FileNotFoundError, RuntimeError) as exc:
+            return {"error": str(exc)}
+
+    def handle_write_workspace_file(filename: str, content: str) -> dict:
+        """Write a file to the active Verilog workspace with history."""
+        try:
+            path = workspace.write_file(filename, content)
+            return {"success": True, "path": str(path)}
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+
+    def handle_list_workspace_files() -> dict:
+        """List all files in the active Verilog workspace."""
+        try:
+            files = workspace.list_files()
+            return {"files": files, "active_module": workspace.active_module}
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Librelane integration
+    # ------------------------------------------------------------------
+
+    def handle_package_for_librelane(
+        module_name: str,
+        clock_port: str = "clk",
+        clock_period: float = 10.0,
+    ) -> dict:
+        """Package workspace files for librelane and generate config."""
+        try:
+            # Create design directory in workspace
+            design_dir = settings.workspace_dir / module_name / "librelane_design"
+
+            # Use workspace manager to copy files
+            copied = workspace.package_for_librelane(design_dir, module_name)
+            if not copied:
+                return {"error": f"No .v/.sv files found in workspace for module '{module_name}'."}
+
+            # Generate librelane config
+            config_path = runner.generate_config(
+                design_dir=design_dir,
+                module_name=module_name,
+                clock_port=clock_port,
+                clock_period=clock_period,
+            )
+
+            # Check for existing runs
+            existing_runs = runner.check_existing_runs(design_dir)
+
+            result: Dict[str, Any] = {
+                "success": True,
+                "design_dir": str(design_dir),
+                "config_path": str(config_path),
+                "files_packaged": [str(f) for f in copied],
+            }
+
+            if existing_runs:
+                result["existing_runs"] = existing_runs
+                result["message"] = (
+                    f"Found {len(existing_runs)} existing run(s). "
+                    "Use run_librelane_flow to start a new run, or inspect existing results."
+                )
+
+            return result
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def handle_run_librelane_flow(module_name: str) -> dict:
+        """Execute the librelane flow on a packaged design."""
+        try:
+            design_dir = settings.workspace_dir / module_name / "librelane_design"
+
+            if not design_dir.exists():
+                return {
+                    "error": f"Design directory not found: {design_dir}. Run package_for_librelane first."
+                }
+
+            # Check for existing runs first
+            existing_runs = runner.check_existing_runs(design_dir)
+
+            # Run the flow
+            result = runner.run_flow(design_dir)
+
+            if result.get("success"):
+                # Parse results from the latest run
+                runs = runner.check_existing_runs(design_dir)
+                if runs:
+                    latest = runs[-1]
+                    parsed = runner.parse_run_results(Path(latest["path"]))
+                    result["parsed_results"] = parsed
+
+            return result
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    return {
+        "parse_spec_to_json": handle_parse_spec_to_json,
+        "run_spec2rtl_pipeline": handle_run_spec2rtl_pipeline,
+        "run_spec2rtl_from_file": handle_run_spec2rtl_from_file,
+        "query_memory": handle_query_memory,
+        "read_workspace_file": handle_read_workspace_file,
+        "write_workspace_file": handle_write_workspace_file,
+        "list_workspace_files": handle_list_workspace_files,
+        "package_for_librelane": handle_package_for_librelane,
+        "run_librelane_flow": handle_run_librelane_flow,
+    }
+
+
+=== FILE: ./cirbuild/agent/client.py ===
+"""Cirbuild Agent — dedicated LLM-powered assistant for IC design.
+
+Uses its own LLM API channel (separate from spec2rtl backend) to
+provide interactive assistance with hardware specification, RTL
+generation, debugging, and physical design flow.
+"""
+
+from __future__ import annotations
+import os
+import json
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+import litellm
+from litellm import completion
+
+from cirbuild.config.settings import CirbuildSettings
+
+if TYPE_CHECKING:
+    from cirbuild.librelane.runner import LibrelaneRunner
+    from cirbuild.memory.rag_store import RAGStore
+    from cirbuild.workspace.manager import WorkspaceManager
+
+logger = logging.getLogger("cirbuild.agent")
+
+
+class CirbuildAgent:
+    """Interactive LLM agent for the Cirbuild EDA workflow.
+
+    Maintains conversation history and executes tool calls for
+    pipeline invocation, workspace editing, and librelane execution.
+
+    Args:
+        settings: CirbuildSTG settings. Loaded from defaults if None.
+    """
+
+    @staticmethod
+    def _render_system_prompt(user_role: str | None = None) -> str:
+        """Render the system prompt from the Jinja2 template.
+
+        Falls back to a hardcoded prompt if the template is unavailable.
+        """
+        try:
+            from jinja2 import Environment, FileSystemLoader
+
+            template_dir = Path(__file__).parent / "prompts"
+            env = Environment(loader=FileSystemLoader(str(template_dir)))
+            template = env.get_template("system.jinja2")
+            return template.render(user_role=user_role)
+        except Exception:
+            # Fallback if template loading fails
+            return (
+                "You are Cirbuild, an expert AI assistant for Integrated Circuit design. "
+                "You help users design hardware modules by:\n"
+                "1. Understanding their hardware specifications\n"
+                "2. Running the Spec2RTL pipeline to generate RTL code\n"
+                "3. Helping debug and edit the generated Verilog/SystemVerilog\n"
+                "4. Running the Librelane physical design flow for GDSII generation\n\n"
+                "You have access to tools for pipeline execution, workspace management, "
+                "and memory retrieval. Use them when appropriate.\n\n"
+                "When a user describes a hardware module, use the parse_spec_to_json tool "
+                "to structure their description, then run_spec2rtl_pipeline to generate RTL.\n\n"
+                "Be concise, technical, and helpful. When showing code, use proper formatting."
+            )
+
+    def __init__(self, settings: CirbuildSettings | None = None) -> None:
+        self._settings = settings or CirbuildSettings.from_yaml()
+        self._system_prompt = self._render_system_prompt()
+        self._history: List[dict] = [
+            {"role": "system", "content": self._system_prompt}
+        ]
+        self._tools: List[dict] = []
+        self._tool_handlers: Dict[str, Callable] = {}
+
+        # Phase 3: RAG memory store and workspace manager
+        from cirbuild.memory.rag_store import RAGStore as _RAGStore
+        from cirbuild.workspace.manager import WorkspaceManager as _WorkspaceManager
+
+        self._rag_store: RAGStore = _RAGStore()
+        self._workspace: WorkspaceManager = _WorkspaceManager(
+            self._settings.workspace_dir
+        )
+
+        # Phase 4: Librelane runner
+        from cirbuild.librelane.runner import LibrelaneRunner as _LibrelaneRunner
+
+        self._librelane: LibrelaneRunner = _LibrelaneRunner(self._settings)
+
+        self._setup_default_tools()
+
+    @property
+    def rag_store(self) -> RAGStore:
+        """The agent's BM25 RAG memory store."""
+        return self._rag_store
+
+    @property
+    def workspace(self) -> WorkspaceManager:
+        """The agent's Verilog workspace manager."""
+        return self._workspace
+
+    @property
+    def librelane(self) -> LibrelaneRunner:
+        """The agent's Librelane flow runner."""
+        return self._librelane
+
+    def _setup_default_tools(self) -> None:
+        """Register the default tool definitions and handlers.
+
+        Passes the RAG store, workspace manager, and librelane runner
+        to the tool handlers so that all tools use real implementations.
+        """
+        from cirbuild.agent.tools import get_tool_definitions, get_tool_handlers
+
+        self._tools = get_tool_definitions()
+        self._tool_handlers = get_tool_handlers(
+            self._settings,
+            rag_store=self._rag_store,
+            workspace_manager=self._workspace,
+            librelane_runner=self._librelane,
+        )
+
+    def register_tool(
+        self,
+        definition: dict,
+        handler: Callable,
+    ) -> None:
+        """Register an additional tool for the agent.
+
+        Args:
+            definition: OpenAI-format tool definition dict.
+            handler: Callable that executes the tool.
+        """
+        self._tools.append(definition)
+        name = definition["function"]["name"]
+        self._tool_handlers[name] = handler
+
+    def chat(self, user_message: str) -> str:
+        """Send a message and get the agent's response.
+
+        Handles the tool-calling loop: if the LLM returns tool calls,
+        executes them and feeds results back until a text response is produced.
+
+        Args:
+            user_message: The user's input message.
+
+        Returns:
+            The agent's text response.
+        """
+        self._history.append({"role": "user", "content": user_message})
+
+        max_tool_rounds = 5  # Prevent infinite tool-calling loops
+
+        for round_num in range(max_tool_rounds):
+            logger.info("🔄 Tool-calling round %d/%d", round_num + 1, max_tool_rounds)
+            response = self._call_llm()
+
+            message = response.choices[0].message
+
+            # If no tool calls, return the text response
+            if not message.tool_calls:
+                assistant_content = message.content or ""
+                self._history.append(
+                    {"role": "assistant", "content": assistant_content}
+                )
+                logger.info("✅ Agent returned text response in round %d", round_num + 1)
+                return assistant_content
+
+            logger.info("📞 Agent made %d tool call(s) in round %d", len(message.tool_calls), round_num + 1)
+
+            # Process tool calls
+            # Build a clean assistant message with only standard fields
+            tool_calls_data = None
+            if message.tool_calls:
+                tool_calls_data = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in message.tool_calls
+                ]
+
+            assistant_msg = {"role": "assistant", "content": message.content or ""}
+            if tool_calls_data:
+                assistant_msg["tool_calls"] = tool_calls_data
+            self._history.append(assistant_msg)
+
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    tool_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                logger.info("🔧 Tool call: %s(%s)", tool_name, tool_args)
+
+                # Execute the tool
+                result = self._execute_tool(tool_name, tool_args)
+
+                # Log tool execution result
+                if isinstance(result, dict) and "error" in result:
+                    logger.error("❌ Tool %s returned error: %s", tool_name, result["error"])
+                else:
+                    logger.info("✅ Tool %s executed successfully", tool_name)
+
+                # Add tool result to history
+                self._history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": (
+                            json.dumps(result)
+                            if isinstance(result, dict)
+                            else str(result)
+                        ),
+                    }
+                )
+
+        # If we exhausted tool rounds, return what we have
+        return "[Agent reached maximum tool-calling rounds. Please try again.]"
+
+    @staticmethod
+    def _resolve_api_key(model: str) -> str | None:
+        """Resolve the correct API key for a given model string.
+
+        Inspects the model prefix to select the appropriate provider key
+        from the environment. This allows the agent to use different
+        providers for primary and fallback models without coupling to a
+        single API key.
+
+        Key environment variables (set in .env):
+            CIRBUILD_OPENROUTER_KEY  — for ``openrouter/`` models
+            CIRBUILD_GEMINI_KEY      — for ``gemini/`` models
+            CIRBUILD_ANTHROPIC_KEY   — for ``anthropic/`` models
+
+        Args:
+            model: LiteLLM model string (e.g. ``openrouter/minimax/minimax-m2.5``).
+
+        Returns:
+            The resolved API key string, or None if no matching key is set.
+        """
+        if model.startswith("gemini/"):
+            return os.environ.get("CIRBUILD_GEMINI_KEY")
+        if model.startswith("anthropic/"):
+            return os.environ.get("CIRBUILD_ANTHROPIC_KEY")
+        if model.startswith("openrouter/"):
+            return os.environ.get("CIRBUILD_OPENROUTER_KEY")
+        # Unknown provider prefix — let LiteLLM fall back to its own env detection
+        return None
+
+    def _call_llm(self) -> Any:
+        """Make an LLM API call with the current history and tools.
+
+        Uses the agent's dedicated LLM configuration, NOT the spec2rtl backend's.
+        Dynamically swaps the API key based on the active model's provider prefix
+        so that fallback models can use a different provider without extra config.
+
+        Returns:
+            The litellm completion response.
+        """
+        kwargs: dict[str, Any] = {
+            "model": self._settings.agent_model,
+            "api_key": self._resolve_api_key(self._settings.agent_model),
+            "messages": self._history,
+            "temperature": self._settings.agent_temperature,
+            "max_tokens": self._settings.agent_max_tokens,
+        }
+
+        if self._tools:
+            kwargs["tools"] = self._tools
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            return completion(**kwargs)
+        except Exception as exc:
+            # Try fallback models — swap the API key for each provider
+            for fallback in self._settings.agent_fallback_models:
+                try:
+                    kwargs["model"] = fallback
+                    kwargs["api_key"] = self._resolve_api_key(fallback)
+                    logger.warning("Falling back to model: %s", fallback)
+                    return completion(**kwargs)
+                except Exception:
+                    continue
+            raise RuntimeError(
+                f"All agent LLM models failed. Last error: {exc}"
+            ) from exc
+
+    def _execute_tool(self, name: str, args: dict) -> Any:
+        """Execute a registered tool by name.
+
+        Args:
+            name: Tool function name.
+            args: Tool arguments dict.
+
+        Returns:
+            Tool execution result.
+        """
+        handler = self._tool_handlers.get(name)
+        if handler is None:
+            return {"error": f"Unknown tool: {name}"}
+
+        try:
+            return handler(**args)
+        except Exception as exc:
+            logger.error("Tool %s failed: %s", name, exc)
+            return {"error": f"Tool execution failed: {str(exc)}"}
+
+    def get_history(self) -> List[dict]:
+        """Return the conversation history."""
+        return list(self._history)
+
+    def clear_history(self) -> None:
+        """Clear conversation history, keeping only the system prompt."""
+        self._history = [{"role": "system", "content": self._system_prompt}]
+
+
+=== FILE: ./cirbuild/agent/__init__.py ===
+"""Cirbuild agent package — dedicated LLM-powered assistant."""
+
+from cirbuild.agent.client import CirbuildAgent
+
+__all__ = ["CirbuildAgent"]
+
+
+=== FILE: ./cirbuild/__main__.py ===
+"""CLI entry point for CirbuildSTG.
+
+Usage:
+    python -m cirbuild              # Start interactive chat
+    python -m cirbuild --config custom.yaml
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    """Parse CLI arguments and launch the Cirbuild agent."""
+    parser = argparse.ArgumentParser(
+        prog="cirbuild",
+        description="CirbuildSTG — AI-Powered Spec-to-GDSII IC Design Assistant",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to a CirbuildSTG configuration YAML file.",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Show version and exit.",
+    )
+
+    args = parser.parse_args()
+
+    if args.version:
+        from cirbuild import __version__
+
+        print(f"CirbuildSTG v{__version__}")
+        return 0
+
+    from cirbuild.cli import run_cli
+
+    run_cli(config_path=args.config)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+=== FILE: ./cirbuild/workspace/__init__.py ===
+"""Cirbuild Verilog workspace package."""
+
+from cirbuild.workspace.manager import WorkspaceManager
+
+__all__ = ["WorkspaceManager"]
+
+
+=== FILE: ./cirbuild/workspace/manager.py ===
+"""Verilog workspace manager for the Cirbuild agent.
+
+Provides a dedicated directory for editing RTL files produced by
+the spec2rtl pipeline, with automatic history snapshots for undo.
+"""
+
+import logging
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger("cirbuild.workspace")
+
+
+class WorkspaceManager:
+    """Manages a dedicated workspace for Verilog/SystemVerilog editing.
+
+    Structure::
+
+        workspace_root/
+        └── <module_name>/
+            ├── <module_name>.v
+            ├── <module_name>_tb.v
+            └── .history/
+                ├── 001_<module_name>.v
+                └── 002_<module_name>.v
+
+    Args:
+        workspace_root: Root directory for all workspaces.
+    """
+
+    def __init__(self, workspace_root: Path) -> None:
+        self._root = Path(workspace_root)
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._active_module: Optional[str] = None
+
+    @property
+    def active_module(self) -> Optional[str]:
+        """The currently active module name."""
+        return self._active_module
+
+    @property
+    def active_dir(self) -> Optional[Path]:
+        """Path to the active module's workspace directory."""
+        if self._active_module:
+            return self._root / self._active_module
+        return None
+
+    def _safe_path(self, filename: str) -> Path:
+        """Resolve filename and ensure it stays within the active workspace."""
+        if not self._active_module:
+            raise RuntimeError("No active workspace. Run a pipeline first.")
+        module_dir = (self._root / self._active_module).resolve()
+        resolved = (module_dir / filename).resolve()
+        if not resolved.is_relative_to(module_dir):
+            raise ValueError(f"Path traversal detected: {filename!r}")
+        return resolved
+
+    def init_from_synthesis(
+        self,
+        rtl_path: str,
+        module_name: str,
+    ) -> Path:
+        """Initialize workspace from a synthesis result.
+
+        Copies the generated RTL file into a new workspace directory
+        and sets it as the active module.
+
+        Args:
+            rtl_path: Path to the generated RTL file.
+            module_name: Name of the hardware module.
+
+        Returns:
+            Path to the workspace directory.
+        """
+        safe_name = (
+            module_name.strip().lower().replace(" ", "_").replace("-", "_")
+        )
+        module_dir = self._root / safe_name
+        module_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create history directory
+        history_dir = module_dir / ".history"
+        history_dir.mkdir(exist_ok=True)
+
+        # Copy RTL file
+        src = Path(rtl_path)
+        if src.exists():
+            dest = module_dir / src.name
+            shutil.copy2(src, dest)
+            # Save initial version to history
+            self._save_history(dest)
+            logger.info(
+                "Initialized workspace for '%s' from %s", safe_name, src
+            )
+        else:
+            logger.warning("RTL file not found: %s", rtl_path)
+
+        self._active_module = safe_name
+        return module_dir
+
+    def read_file(self, filename: str) -> str:
+        """Read a file from the active workspace.
+
+        Args:
+            filename: Name of the file to read.
+
+        Returns:
+            File contents as a string.
+
+        Raises:
+            FileNotFoundError: If the file doesn't exist.
+            RuntimeError: If no workspace is active.
+            ValueError: If the path escapes the workspace sandbox.
+        """
+        file_path = self._safe_path(filename)
+        if not file_path.exists():
+            raise FileNotFoundError(
+                f"File not found in workspace: {filename}"
+            )
+
+        return file_path.read_text(encoding="utf-8")
+
+    def write_file(self, filename: str, content: str) -> Path:
+        """Write a file to the active workspace with history snapshot.
+
+        Args:
+            filename: Name of the file to write.
+            content: Full file content.
+
+        Returns:
+            Path to the written file.
+
+        Raises:
+            RuntimeError: If no workspace is active.
+            ValueError: If the path escapes the workspace sandbox.
+        """
+        file_path = self._safe_path(filename)
+
+        # Save history before overwriting
+        if file_path.exists():
+            self._save_history(file_path)
+
+        file_path.write_text(content, encoding="utf-8")
+        logger.info("Wrote %s to workspace", filename)
+        return file_path
+
+    def list_files(self) -> List[str]:
+        """List all files in the active workspace (excluding .history).
+
+        Returns:
+            List of filenames.
+
+        Raises:
+            RuntimeError: If no workspace is active.
+        """
+        if not self._active_module:
+            raise RuntimeError("No active workspace. Run a pipeline first.")
+
+        module_dir = self._root / self._active_module
+        if not module_dir.exists():
+            return []
+
+        files = []
+        for f in sorted(module_dir.iterdir()):
+            if f.is_file() and not f.name.startswith("."):
+                files.append(f.name)
+        return files
+
+    def get_history(self, filename: str) -> List[Path]:
+        """Get history snapshots for a file.
+
+        Args:
+            filename: Name of the file.
+
+        Returns:
+            List of history file paths, oldest first.
+        """
+        if not self._active_module:
+            return []
+
+        history_dir = self._root / self._active_module / ".history"
+        if not history_dir.exists():
+            return []
+
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        pattern = f"*_{stem}{suffix}"
+
+        return sorted(history_dir.glob(pattern))
+
+    def _save_history(self, file_path: Path) -> None:
+        """Save a snapshot of a file to the history directory."""
+        if not file_path.exists():
+            return
+
+        history_dir = file_path.parent / ".history"
+        history_dir.mkdir(exist_ok=True)
+
+        # Find the highest existing snapshot number
+        stem = file_path.stem
+        suffix = file_path.suffix
+        existing = list(history_dir.glob(f"*_{stem}{suffix}"))
+
+        max_num = 0
+        for snap in existing:
+            try:
+                num = int(snap.stem.split("_", 1)[0])
+                max_num = max(max_num, num)
+            except (ValueError, IndexError):
+                pass
+
+        next_num = max_num + 1
+        snapshot_name = f"{next_num:03d}_{stem}{suffix}"
+        snapshot_path = history_dir / snapshot_name
+        shutil.copy2(file_path, snapshot_path)
+        logger.debug("Saved history snapshot: %s", snapshot_name)
+
+    def package_for_librelane(
+        self,
+        target_dir: Path,
+        module_name: Optional[str] = None,
+    ) -> List[Path]:
+        """Package workspace files into a librelane-compatible directory.
+
+        Creates the directory structure expected by librelane::
+
+            target_dir/
+            └── src/
+                └── *.v
+
+        Args:
+            target_dir: Target directory for the librelane design.
+            module_name: Module name override. Uses active module if None.
+
+        Returns:
+            List of copied file paths.
+        """
+        mod = module_name or self._active_module
+        if not mod:
+            raise RuntimeError("No active workspace. Run a pipeline first.")
+
+        module_dir = self._root / mod
+        if not module_dir.exists():
+            raise FileNotFoundError(
+                f"Workspace not found for module: {mod}"
+            )
+
+        # Create librelane src directory
+        src_dir = target_dir / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+
+        copied: List[Path] = []
+        for f in module_dir.iterdir():
+            if (
+                f.is_file()
+                and f.suffix in (".v", ".sv")
+                and not f.name.startswith(".")
+            ):
+                dest = src_dir / f.name
+                shutil.copy2(f, dest)
+                copied.append(dest)
+                logger.info("Packaged %s → %s", f.name, dest)
+
+        return copied
+
+
+=== FILE: ./cirbuild/memory/rag_store.py ===
+"""BM25-based short-term memory store for the Cirbuild agent.
+
+Provides keyword-based retrieval over pipeline artifacts (spec text,
+pseudocode plans, and RTL code). Uses BM25 scoring for ranking —
+no external embedding models required.
+
+This store is ephemeral (session-scoped) and optimized for the
+syntax-heavy, semantics-light nature of hardware descriptions
+where exact signal names and keywords matter more than semantic similarity.
+"""
+
+import math
+import re
+import logging
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger("cirbuild.memory.rag_store")
+
+# Valid namespace names
+NAMESPACES = ("spec", "pseudocode", "rtl")
+
+
+@dataclass
+class Chunk:
+    """A single indexed text chunk."""
+
+    text: str
+    namespace: str
+    metadata: Dict[str, str] = field(default_factory=dict)
+    tokens: List[str] = field(default_factory=list)
+
+
+class RAGStore:
+    """BM25-based in-memory retrieval store.
+
+    Stores text chunks across three namespaces (spec, pseudocode, rtl)
+    and retrieves the most relevant chunks for a given query using
+    BM25 scoring.
+
+    Args:
+        k1: BM25 term frequency saturation parameter. Default 1.5.
+        b: BM25 document length normalization parameter. Default 0.75.
+        chunk_size: Maximum characters per chunk when splitting. Default 500.
+        chunk_overlap: Character overlap between chunks. Default 100.
+    """
+
+    def __init__(
+        self,
+        k1: float = 1.5,
+        b: float = 0.75,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+    ) -> None:
+        self._k1 = k1
+        self._b = b
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
+        self._chunks: List[Chunk] = []
+        self._idf_cache: Dict[str, float] = {}
+        self._avg_dl: float = 0.0
+        self._dirty = True  # IDF needs recomputation
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """Tokenize text into lowercase words, preserving signal names.
+
+        Handles hardware-specific tokens like signal_name, bit widths,
+        and Verilog keywords.
+        """
+        # Split on whitespace and punctuation, but keep underscores and brackets
+        tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*|\d+", text.lower())
+        return tokens
+
+    def _split_into_chunks(
+        self,
+        text: str,
+        namespace: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> List[Chunk]:
+        """Split text into overlapping chunks."""
+        meta = metadata or {}
+        chunks: List[Chunk] = []
+
+        if len(text) <= self._chunk_size:
+            tokens = self._tokenize(text)
+            chunks.append(
+                Chunk(text=text, namespace=namespace, metadata=meta, tokens=tokens)
+            )
+            return chunks
+
+        start = 0
+        while start < len(text):
+            end = start + self._chunk_size
+            chunk_text = text[start:end]
+
+            # Try to break at a newline or space
+            if end < len(text):
+                last_newline = chunk_text.rfind("\n")
+                if last_newline > self._chunk_size // 2:
+                    chunk_text = chunk_text[:last_newline]
+                    end = start + last_newline
+
+            tokens = self._tokenize(chunk_text)
+            chunks.append(
+                Chunk(
+                    text=chunk_text.strip(),
+                    namespace=namespace,
+                    metadata=meta,
+                    tokens=tokens,
+                )
+            )
+
+            start = end - self._chunk_overlap
+            if start >= len(text):
+                break
+
+        return chunks
+
+    def add(
+        self,
+        text: str,
+        namespace: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> int:
+        """Add a text document to the store.
+
+        The text is split into chunks and indexed for BM25 retrieval.
+
+        Args:
+            text: The text content to store.
+            namespace: One of 'spec', 'pseudocode', 'rtl'.
+            metadata: Optional metadata dict (e.g., module_name, source).
+
+        Returns:
+            Number of chunks created.
+
+        Raises:
+            ValueError: If namespace is invalid.
+        """
+        if namespace not in NAMESPACES:
+            raise ValueError(
+                f"Invalid namespace '{namespace}'. Must be one of {NAMESPACES}"
+            )
+
+        if not text.strip():
+            return 0
+
+        new_chunks = self._split_into_chunks(text, namespace, metadata)
+        self._chunks.extend(new_chunks)
+        self._dirty = True
+
+        logger.debug("Added %d chunks to '%s' namespace", len(new_chunks), namespace)
+        return len(new_chunks)
+
+    def store_pipeline_artifacts(self, artifacts: "PipelineArtifacts") -> None:
+        """Convenience method to store all pipeline artifacts.
+
+        Args:
+            artifacts: A PipelineArtifacts instance from the pipeline bridge.
+        """
+        meta = {"module_name": artifacts.module_name}
+
+        if artifacts.spec_text:
+            self.add(artifacts.spec_text, "spec", meta)
+
+        if artifacts.pseudocode:
+            self.add(artifacts.pseudocode, "pseudocode", meta)
+
+        if artifacts.rtl_code:
+            self.add(artifacts.rtl_code, "rtl", meta)
+
+        logger.info(
+            "Stored pipeline artifacts for '%s': %d total chunks",
+            artifacts.module_name,
+            len(self._chunks),
+        )
+
+    def query(
+        self,
+        query: str,
+        namespace: str = "all",
+        top_k: int = 5,
+    ) -> List[Tuple[float, Chunk]]:
+        """Query the store and return the most relevant chunks.
+
+        Args:
+            query: The search query string.
+            namespace: Namespace to search ('spec', 'pseudocode', 'rtl', or 'all').
+            top_k: Maximum number of results to return.
+
+        Returns:
+            List of (score, Chunk) tuples, sorted by descending score.
+        """
+        if not self._chunks:
+            return []
+
+        if self._dirty:
+            self._recompute_idf()
+
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+
+        # Filter by namespace
+        if namespace == "all":
+            candidates = self._chunks
+        else:
+            candidates = [c for c in self._chunks if c.namespace == namespace]
+
+        if not candidates:
+            return []
+
+        # Score each candidate with BM25
+        scored: List[Tuple[float, Chunk]] = []
+        for chunk in candidates:
+            score = self._bm25_score(query_tokens, chunk)
+            if score > 0:
+                scored.append((score, chunk))
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:top_k]
+
+    def _recompute_idf(self) -> None:
+        """Recompute IDF values and average document length."""
+        n = len(self._chunks)
+        if n == 0:
+            self._avg_dl = 0.0
+            self._idf_cache = {}
+            self._dirty = False
+            return
+
+        # Document frequency for each term
+        df: Counter = Counter()
+        total_length = 0
+
+        for chunk in self._chunks:
+            unique_tokens = set(chunk.tokens)
+            for token in unique_tokens:
+                df[token] += 1
+            total_length += len(chunk.tokens)
+
+        self._avg_dl = total_length / n
+
+        # IDF with smoothing: log((N - df + 0.5) / (df + 0.5) + 1)
+        self._idf_cache = {}
+        for term, freq in df.items():
+            self._idf_cache[term] = math.log(
+                (n - freq + 0.5) / (freq + 0.5) + 1.0
+            )
+
+        self._dirty = False
+
+    def _bm25_score(self, query_tokens: List[str], chunk: Chunk) -> float:
+        """Compute BM25 score for a chunk against query tokens."""
+        if not chunk.tokens:
+            return 0.0
+
+        dl = len(chunk.tokens)
+        tf_map = Counter(chunk.tokens)
+        score = 0.0
+
+        for qt in query_tokens:
+            if qt not in self._idf_cache:
+                continue
+
+            idf = self._idf_cache[qt]
+            tf = tf_map.get(qt, 0)
+
+            # BM25 formula
+            numerator = tf * (self._k1 + 1)
+            denominator = tf + self._k1 * (
+                1 - self._b + self._b * dl / max(self._avg_dl, 1)
+            )
+            score += idf * (numerator / denominator)
+
+        return score
+
+    def clear(self, namespace: Optional[str] = None) -> None:
+        """Clear stored chunks.
+
+        Args:
+            namespace: If provided, clear only that namespace.
+                If None, clear everything.
+        """
+        if namespace is None:
+            self._chunks.clear()
+        else:
+            self._chunks = [c for c in self._chunks if c.namespace != namespace]
+        self._dirty = True
+        logger.info(
+            "Cleared memory%s",
+            f" (namespace: {namespace})" if namespace else "",
+        )
+
+    def stats(self) -> Dict[str, int]:
+        """Return chunk counts per namespace."""
+        counts: Dict[str, int] = {ns: 0 for ns in NAMESPACES}
+        for chunk in self._chunks:
+            counts[chunk.namespace] = counts.get(chunk.namespace, 0) + 1
+        counts["total"] = len(self._chunks)
+        return counts
+
+
+=== FILE: ./cirbuild/memory/__init__.py ===
+"""Cirbuild short-term memory package."""
+
+from cirbuild.memory.rag_store import RAGStore
+
+__all__ = ["RAGStore"]
+
+
+=== FILE: ./cirbuild/__init__.py ===
+"""CirbuildSTG: Agentic AI EDA tool for Spec-to-GDSII IC design."""
+
+__version__ = "0.1.0"
+
+
+=== FILE: ./cirbuild/cli.py ===
+"""CLI chat loop for the Cirbuild agent.
+
+Provides an interactive terminal interface with /command dispatch
+and natural language routing to the LLM agent.
+"""
+
+import logging
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
+
+from cirbuild.agent.client import CirbuildAgent
+from cirbuild.config.settings import CirbuildSettings
+
+logger = logging.getLogger("cirbuild.cli")
+console = Console()
+
+
+def print_welcome() -> None:
+    """Display the welcome banner."""
+    console.print(
+        Panel(
+            "[bold cyan]Cirbuild[/bold cyan] — AI-Powered IC Design Assistant\n"
+            "[dim]Spec-to-GDSII Electronic Design Automation[/dim]\n\n"
+            "Type your hardware specification or use /help for commands.\n"
+            "Type /quit to exit.",
+            title="🔧 CirbuildSTG v0.1",
+            border_style="cyan",
+        )
+    )
+
+
+def print_help() -> None:
+    """Display available commands."""
+    help_text = """
+**Available Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `/spec <file>` | Load a spec file (PDF, TXT, JSON) and run pipeline |
+| `/workspace` | List files in the Verilog workspace |
+| `/edit <file>` | Show a workspace file for discussion |
+| `/package <module>` | Package workspace for Librelane |
+| `/run-librelane <module>` | Execute the Librelane flow |
+| `/status` | Show current session status |
+| `/clear` | Clear conversation history |
+| `/help` | Show this help message |
+| `/quit` | Exit Cirbuild |
+
+Or just type naturally to chat with the agent!
+"""
+    console.print(Markdown(help_text))
+
+
+def handle_command(command: str, agent: CirbuildAgent) -> bool:
+    """Handle a /command input.
+
+    Args:
+        command: The command string (without the leading /).
+        agent: The active CirbuildAgent instance.
+
+    Returns:
+        True if the CLI should continue, False to exit.
+    """
+    parts = command.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd in ("quit", "exit"):
+        console.print("[dim]Goodbye![/dim]")
+        return False
+
+    elif cmd == "help":
+        print_help()
+
+    elif cmd == "clear":
+        agent.clear_history()
+        console.print("[dim]Conversation history cleared.[/dim]")
+
+    elif cmd == "status":
+        history_len = len(agent.get_history()) - 1  # Exclude system prompt
+        console.print(f"[dim]Session messages: {history_len}[/dim]")
+
+    elif cmd == "spec":
+        if not arg:
+            console.print("[red]Usage: /spec <file_path>[/red]")
+        else:
+            file_path = Path(arg)
+            if not file_path.exists():
+                console.print(f"[red]File not found: {file_path}[/red]")
+            else:
+                console.print(f"[dim]Loading spec from {file_path}...[/dim]")
+                # Route through agent for proper tool handling
+                response = agent.chat(
+                    f"Run the Spec2RTL pipeline on this file: {file_path}"
+                )
+                console.print(Markdown(response))
+
+    elif cmd == "workspace":
+        response = agent.chat("List all files in the workspace.")
+        console.print(Markdown(response))
+
+    elif cmd == "edit":
+        if not arg:
+            console.print("[red]Usage: /edit <filename>[/red]")
+        else:
+            response = agent.chat(
+                f"Show me the contents of workspace file: {arg}"
+            )
+            console.print(Markdown(response))
+
+    elif cmd == "package":
+        if not arg:
+            console.print("[red]Usage: /package <module_name>[/red]")
+        else:
+            response = agent.chat(
+                f"Package the workspace files for Librelane with module name: {arg}"
+            )
+            console.print(Markdown(response))
+
+    elif cmd == "run-librelane":
+        if not arg:
+            console.print("[red]Usage: /run-librelane <module_name>[/red]")
+        else:
+            response = agent.chat(
+                f"Run the Librelane physical design flow for module: {arg}"
+            )
+            console.print(Markdown(response))
+
+    else:
+        console.print(
+            f"[red]Unknown command: /{cmd}. Type /help for available commands.[/red]"
+        )
+
+    return True
+
+
+def run_cli(config_path: Path | None = None) -> None:
+    """Run the interactive CLI chat loop.
+
+    Args:
+        config_path: Optional path to a CirbuildSTG config YAML.
+    """
+    settings = CirbuildSettings.from_yaml(config_path)
+    agent = CirbuildAgent(settings)
+
+    print_welcome()
+
+    while True:
+        try:
+            user_input = console.input("[bold green]You>[/bold green] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye![/dim]")
+            break
+
+        if not user_input:
+            continue
+
+        # Command dispatch
+        if user_input.startswith("/"):
+            should_continue = handle_command(user_input[1:], agent)
+            if not should_continue:
+                break
+            continue
+
+        # Regular message — route to agent
+        with console.status("[dim]Thinking...[/dim]", spinner="dots"):
+            try:
+                response = agent.chat(user_input)
+            except Exception as exc:
+                console.print(f"[red]Agent error: {exc}[/red]")
+                continue
+
+        console.print()
+        console.print(
+            Panel(
+                Markdown(response),
+                title="[bold cyan]Cirbuild[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        console.print()
+
+
+=== FILE: ./cirbuild/config/settings.py ===
+"""CirbuildSTG configuration management.
+
+Manages settings for the Cirbuild agent client, completely separate
+from the spec2rtl backend configuration. The agent has its own LLM
+API channel, workspace paths, and librelane integration settings.
+"""
+
+from pathlib import Path
+from typing import List, Optional
+
+import yaml
+from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+_DEFAULT_CONFIG_PATH = Path(__file__).parent / "default_config.yaml"
+
+
+def _load_yaml_config(path: Path) -> dict:
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+class CirbuildSettings(BaseSettings):
+    """Application-wide settings for the Cirbuild agent client.
+
+    Values are resolved in this priority order (highest wins):
+    1. Environment variables (prefixed with CIRBUILD_)
+    2. Values passed directly to the constructor
+    3. YAML config file values
+    4. Defaults defined below
+    """
+
+    # --- Agent LLM Configuration (SEPARATE from spec2rtl backend) ---
+    agent_model: str = Field(
+        default="openrouter/minimax/minimax-m2.5",
+        description="LLM model for the Cirbuild agent (LiteLLM format).",
+    )
+    agent_fallback_models: List[str] = Field(
+        default_factory=lambda: [
+            "openrouter/google/gemini-2.5-flash",
+        ],
+        description="Fallback models for the agent.",
+    )
+    agent_temperature: float = Field(
+        default=0.3,
+        description="Temperature for agent LLM completions.",
+    )
+    agent_max_tokens: int = Field(
+        default=4096,
+        description="Maximum output tokens for agent completions.",
+    )
+
+    # --- Workspace ---
+    workspace_dir: Path = Field(
+        default=Path("cirbuild_workspace"),
+        description="Root directory for the Verilog editing workspace.",
+    )
+
+    # --- Librelane ---
+    librelane_repo_path: Path = Field(
+        default=Path("../librelane"),
+        description="Path to the librelane repository.",
+    )
+    librelane_pdk_root: str = Field(
+        default="~/.ciel",
+        description="PDK root directory for librelane.",
+    )
+    librelane_pdk: str = Field(
+        default="sky130A",
+        description="Target PDK for librelane flow.",
+    )
+
+    # --- Spec2RTL Backend ---
+    spec2rtl_config_path: Optional[Path] = Field(
+        default=None,
+        description="Path to spec2rtl config YAML. Uses spec2rtl defaults if None.",
+    )
+
+    model_config = {
+        "env_prefix": "CIRBUILD_",
+        "env_nested_delimiter": "__",
+    }
+
+    @classmethod
+    def from_yaml(cls, config_path: Path | None = None) -> "CirbuildSettings":
+        import os
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+        path = config_path or _DEFAULT_CONFIG_PATH
+        yaml_values = _load_yaml_config(path)
+
+        env_prefix = cls.model_config.get("env_prefix", "CIRBUILD_")
+        filtered: dict = {}
+        for key, value in yaml_values.items():
+            env_key = f"{env_prefix}{key.upper()}"
+            if env_key not in os.environ:
+                filtered[key] = value
+
+        return cls(**filtered)
+
+
+=== FILE: ./cirbuild/config/__init__.py ===
+"""CirbuildSTG configuration package."""
+
+from cirbuild.config.settings import CirbuildSettings
+
+__all__ = ["CirbuildSettings"]
+
+
+=== FILE: ./cirbuild_source_code.py ===
+import os
+import json
+import litellm
+import subprocess
+import re
+from litellm import completion
+from litellm.exceptions import RateLimitError, ContextWindowExceededError, APIConnectionError, ServiceUnavailableError, NotFoundError
+from pydantic import BaseModel, Field
+from typing import TypeVar, Type
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Global Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL = "gemini/gemini-3-flash-preview"
+
+FALLBACK_MODELS = [
+    "gemini/gemini-2.5-flash",       
+    "gemini/gemini-2.5-flash-lite", 
+    "gemini/gemini-2.5-pro"          
+]
+_CURRENT_ACTIVE_MODEL = None
+
+load_dotenv()
+
+# Enable client-side schema validation to ensure the LLM respects our rigid structures
+litellm.enable_json_schema_validation = True #
+
+# Setup for generic type hinting (so your IDE knows which Pydantic model is returning)
+T = TypeVar('T', bound=BaseModel)
+# ---------------------------------------------------------------------------
+# Global Dual-Loop Router for JSON / API troubleshooting
+# ---------------------------------------------------------------------------
+def robust_completion(base_model: str, messages: list, response_format: Type[T]) -> T:
+    """
+    A global router that handles JSON formatting retries locally, 
+    but falls back to different API models if Token/Rate limits are hit.
+    """
+    global _CURRENT_ACTIVE_MODEL
+    models_to_try = [base_model] + FALLBACK_MODELS
+    max_attempts = 3
+
+    # --- OUTER LOOP: API Fallback Routing ---
+    for current_model in models_to_try:
+        if current_model != _CURRENT_ACTIVE_MODEL:
+            print(f"  🤖 [Model Active] {current_model}")
+            _CURRENT_ACTIVE_MODEL = current_model
+        # --- INNER LOOP: JSON Retry Logic ---
+        for attempt in range(max_attempts):
+            try:
+                response = completion(
+                    model=current_model,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    messages=messages,
+                    response_format=response_format,
+                )
+                return response_format.model_validate_json(response.choices[0].message.content)
+                
+            except (RateLimitError, ContextWindowExceededError, APIConnectionError) as e:
+                print(f"  ⚠️ [API Limit] Rate/Token limit hit on {current_model}. Routing to fallback...")
+                break  # Break inner loop, move to the next fallback model
+
+            except (ServiceUnavailableError) as e:
+                print(f"  ⚠️ [Server Down] Server issue on {current_model}. Routing to fallback...")
+                break  # Break inner loop, move to the next fallback model    
+
+            except (NotFoundError) as e:
+                print(f"  Model {current_model} Not Found on LiteLLM. Routing to fallback...")
+                break  # Break inner loop, move to the next fallback model
+
+            except Exception as e:
+                last_err = e
+                print(f"  ⚠️ [Attempt {attempt + 1} Failed] JSON/Formatting error on {current_model}. Retrying...")
+                if attempt == max_attempts - 1:
+                    print(f"  ❌ Max formatting retries reached on {current_model}.")
+                    break  # Crash. Do NOT fallback if the model just can't format JSON.
+
+    raise Exception(f"❌ Pipeline failed, last Error is {last_err}.")
+
+
+# ---------------------------------------------------------------------------
+# 1. Rigid Data Structures (Pydantic)
+# These act as the "contracts" between our agents. 
+# ---------------------------------------------------------------------------
+
+class PseudocodePlan(BaseModel):
+    module_name: str = Field(description="The name of the hardware module.")
+    target_compiler: str = Field(description="The target HLS compiler mentioned in the spec (e.g., 'Google XLS', 'Vitis HLS'). If not specified, default to 'Google XLS'.")
+    hardware_classification: str = Field(description="Classify as exactly one: 'COMBINATIONAL', 'SEQUENTIAL_PIPELINE', or 'STATE_MACHINE'.")
+    inputs_outputs: dict[str, str] = Field(description="Dictionary of signal names and their widths.")
+    state_elements: list[str] = Field(description="List any required memory elements, registers, or history arrays. Return empty list if purely combinational.")
+    logic_steps: str = Field(description="Step-by-step pseudocode logic.")
+
+class PythonReference(BaseModel):
+    python_code: str = Field(description="Executable Python code representing the hardware logic.")
+    # test_vectors: list[dict[str, int]] = Field(description="Sample input/output dictionaries for testing.")
+    # Commented to avoid JSON formatting errors and token envelope exhaustion
+
+class CppHlsTarget(BaseModel):
+    cpp_code: str = Field(description="Synthesizable C++ code ready for HLS.")
+    # --- Generalized to avoid triggering Xilinx hallucinations ---
+    compiler_directives: str = Field(description="Comma-separated list of compiler-specific directives used, or 'None'.")
+
+class CppCorrection(BaseModel):
+    fixed_cpp_code: str = Field(description="The corrected C++ code.")
+    explanation: str = Field(description="Brief explanation of what was fixed.")
+
+class CppTestbench(BaseModel):
+    testbench_code: str = Field(description="C++ testbench code containing a main() function to validate the module. Use \\n for newlines.")
+    test_cases_covered: str = Field(description="A brief comma-separated list of the test scenarios covered.")
+
+# ---------------------------------------------------------------------------
+# 2. The Agent Pipeline
+# ---------------------------------------------------------------------------
+
+class CirbuildProgressiveCoder:
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model = model_name
+
+    def understand_and_plan(self, spec_text: str) -> PseudocodePlan:
+        print(f"Step 1: Translating Spec to Pseudocode...")
+        
+        system_prompt = """
+        You are a Senior Hardware Architect. Your job is to extract raw specifications into a rigid architectural plan in pseudocode.
+        Ensure logical correctness and clear signal definitions.
+        CRITICAL TASKS:
+        1. Classify the hardware: Is it purely Combinational (math/logic), a Sequential Pipeline (data flows through stages over multiple clocks), or a State Machine (control logic with distinct states)?
+        2. Identify State: Explicitly list any memory, history, or registers required to persist across clock cycles.
+        3. Define exact bit-widths for all I/O interfaces.
+        """
+        
+        prompt = f"""
+        Hardware Specification:
+        {spec_text}
+        """
+        messages=[
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, PseudocodePlan) 
+
+    def generate_python_gold_model(self, plan: PseudocodePlan) -> PythonReference:
+        print("Step 2: Generating Python Reference Model...")
+        
+        # Notice we are using standard Python f-strings {} here for variable interpolation.
+        # Keep $$ syntax strictly for your LaTeX/Markdown docs, not for passing prompt variables!
+        prompt = f"""
+        Convert this hardware plan into a Python function.
+        Module: {plan.module_name}
+        I/O: {plan.inputs_outputs}
+        Logic: {plan.logic_steps}
+        """
+        system_prompt = """
+        You are a bit-accurate Python hardware modeling expert. Intepret and implement the provided psuedocode plan to functionally and syntatically correct Hardware Python code.
+        CRITICAL STRICT RULES: 
+        1. DO NOT include ANY comments (# lines) in the output code. Provide ONLY the raw logic. 
+        2. BIT-ACCURACY: You MUST emulate hardware bit-widths using bitwise masking (e.g., `val & 0xFF` for 8-bit, `val & 0xFFFF` for 16-bit) after EVERY mathematical operation to perfectly simulate hardware overflow and truncation.
+        3. You MUST strictly adhere to the exact signal names, bit-widths, and data types (signed vs unsigned) specified in the inputs/outputs dictionary.
+        4. IMPORTANT: You are outputting into a JSON string. You must properly escape all newlines as \\n and avoid using double quotes inside the code (use single quotes instead).
+        """
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, PythonReference)
+
+    def generate_hls_cpp(self, py_model: PythonReference, target_compiler: str) -> CppHlsTarget:
+        print(f"Step 3: Translating Python to Synthesizable C++ for [{target_compiler}]...")
+
+        universal_hls_rules = """
+        [UNIVERSAL HLS CONSTRAINTS - APPLY TO ALL COMPILERS]
+        1. NO DYNAMIC MEMORY: You are writing physical silicon. DO NOT use `new`, `malloc`, `std::vector`, or pointers for dynamic allocation. All arrays must have statically known, fixed sizes at compile time.
+        2. STATE ENCAPSULATION: All internal registers, memory, and history must be encapsulated within a `struct` or `class`.
+        3. BIT-ACCURATE TYPES: Use exact-width native types (e.g., `unsigned char`, `unsigned short`). 
+        """
+        compiler_rules = {
+            "google xls": f"""
+                {universal_hls_rules}
+                1. DO NOT use Xilinx Vitis HLS libraries. NO #include "ap_int.h". NO ap_uint.
+                2. DO NOT use Xilinx pragmas. NO #pragma HLS INTERFACE.
+                3. COMPILER SPECIFIC: Use exactly one `#pragma hls_top` before the top-level evaluation function.
+                4. NO SYSTEM HEADERS: DO NOT use ANY #include directives (NO #include <cstdint>). The compiler environment is stripped. 
+                5. Use native C++ built-in types instead of stdint: use `unsigned char` for 8-bit, `unsigned short` for 16-bit, `unsigned int` for 32-bit, and `bool`.
+                6. Always include an explicit active-low reset signal (e.g., rst_n) in the top-level evaluation function parameters and use if (!rst_n) to clear internal states.
+                7. LOOP PRAGMAS: If the hardware is COMBINATIONAL or computing datapath math within a single clock cycle, you MUST precede the `for` loop with `#pragma hls_unroll yes`. If the loop represents a sequential process that takes multiple clock cycles, DO NOT unroll it.
+                8. PASS BY REFERENCE: Pass the state struct by reference into the top-level function.
+            """,
+            "vitis hls": f"""
+                {universal_hls_rules}
+                1. Use standard Xilinx Vitis HLS libraries. You MUST #include "ap_int.h" and use ap_uint/ap_int types.
+                2. Apply appropriate #pragma HLS INTERFACE and #pragma HLS PIPELINE directives.
+                3. Use strictly standard C++ libraries like <cstdint> (e.g., uint8_t, uint16_t, bool).
+            """
+        }
+        
+        selected_rules = compiler_rules["vitis hls"] if "vitis" in target_compiler.lower() else compiler_rules["google xls"]
+
+        system_prompt = f"""
+        You are an expert hardware compiler engineer targeting {target_compiler}. 
+        Translate the provided Python reference model into synthesizable C++.
+        
+        CRITICAL STRICT RULES:
+        {selected_rules}
+        - DO NOT include ANY comments (// or /*) in the output code. Provide ONLY the raw logic.
+        - IMPORTANT: Output into a JSON string. Escape newlines as \\n and use single quotes inside the code.
+        - You MUST strictly adhere to the exact signal names, bit-widths, and data types (signed vs unsigned) specified in the inputs/outputs dictionary.
+        - Always encapsulate module state (registers/arrays) inside a C++ class or struct. DO NOT use global or static variables for hardware state.
+        - Use C++ templates (e.g., template <int N>) and generic for loops for scalable logic rather than hardcoding arrays and manually unrolling shift registers.
+        - "HEADER GUARDS: You MUST wrap the entire C++ code in standard include guards (e.g., `#ifndef MODULE_NAME_H`, `#define MODULE_NAME_H`, ... `#endif`) to prevent duplicate definitions during testbench compilation."
+        """
+        
+        prompt = f"""
+        Python Code:
+        {py_model.python_code}
+        """
+        
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, CppHlsTarget)
+    def patch_xls_headers(self, cpp_code: str) -> str:
+        """
+        Hardcodes a bypass for the missing <cstdint> library in Google XLS 
+        by injecting standard typedefs directly into the file.
+        """
+        # 1. Deterministically strip the problematic standard headers
+        cpp_code = cpp_code.replace("#include <cstdint>", "")
+        cpp_code = cpp_code.replace("#include <stdint.h>", "")
+    
+       # 2. Safely replace exact whole words (using \b boundaries)
+       # This prevents accidentally replacing variables like "my_uint8_t_val"
+        replacements = {
+        r'\buint8_t\b': 'unsigned char',
+        r'\buint16_t\b': 'unsigned short',
+        r'\buint32_t\b': 'unsigned int',
+        r'\buint64_t\b': 'unsigned long long',
+        r'\bint8_t\b': 'signed char',
+        r'\bint16_t\b': 'short',
+        r'\bint32_t\b': 'int',
+        r'\bint64_t\b': 'long long'
+        }
+        for pattern, native_type in replacements.items():
+            cpp_code = re.sub(pattern, native_type, cpp_code)
+        
+        return cpp_code.strip()
+        
+    
+    
+class CirbuildReflectionAgent:
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model = model_name
+    
+    def mock_compile_check(self, filename: str) -> str:
+        """
+        In a real lab environment, this would call your HLS compiler (e.g., Vitis HLS).
+        For testing the loop, we use standard g++ to check basic C++ syntax.
+        (Note: g++ will complain about ap_int.h unless you have the headers in your path, 
+        but we can use this structure to capture any stderr output).
+        """
+        print(f"Running syntax check on {filename}...")
+        try:
+            # -fsyntax-only checks for code errors without trying to link a full executable
+            result = subprocess.run(
+                ["g++", "-fsyntax-only", filename],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return "SUCCESS"
+        except subprocess.CalledProcessError as e:
+            # Return the exact compiler error message
+            return e.stderr
+
+    def run_full_xls_pipeline(self, cpp_filename: str, docker_image: str = "cirbuild-xls:v1"):
+        print(f"\n⚙️ Phase 5: Executing Full Google XLS Compilation Pipeline...")
+        
+        # Define the file progression
+        ir_file = cpp_filename.replace(".cpp", ".ir")
+        opt_ir_file = cpp_filename.replace(".cpp", ".opt.ir")
+        v_file = cpp_filename.replace(".cpp", ".v")
+        
+        local_dir = os.getcwd()
+        
+        # The base command spins up the pre-built image in milliseconds
+        base_docker_cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{local_dir}:/workspace",
+            "-w", "/workspace",
+            docker_image
+        ]
+        
+        try:
+            # ---------------------------------------------------------
+            # Step 1: C++ to XLS IR (xlscc)
+            # ---------------------------------------------------------
+            print("   -> Step 1: Converting C++ to XLS IR...")
+            xlscc_cmd = base_docker_cmd + ["/home/xls-developer/.cache/bazel/_bazel_xls-developer/970c5c2433bb6038ab152477a024c421/execroot/_main/bazel-out/k8-opt/bin/xls/contrib/xlscc/xlscc", cpp_filename]
+            xlscc_process = subprocess.run(xlscc_cmd, check=True, capture_output=True, text=True)
+            with open(ir_file, "w") as f:
+                f.write(xlscc_process.stdout)
+            
+            # ---------------------------------------------------------
+            # Step 2: Optimize the IR (opt_main)
+            # ---------------------------------------------------------
+            print("   -> Step 2: Optimizing IR...")
+            opt_cmd = base_docker_cmd + ["/home/xls-developer/.cache/bazel/_bazel_xls-developer/970c5c2433bb6038ab152477a024c421/execroot/_main/bazel-out/k8-opt/bin/xls/tools/opt_main", ir_file]
+            
+            # opt_main outputs to stdout, so we capture it and write to file
+            opt_process = subprocess.run(opt_cmd, check=True, capture_output=True, text=True)
+            with open(opt_ir_file, "w") as f:
+                f.write(opt_process.stdout)
+
+            # ---------------------------------------------------------
+            # Step 3: Generate Verilog (codegen_main)
+            # ---------------------------------------------------------
+            print("   -> Step 3: Generating Synthesizable Verilog...")
+            codegen_cmd = base_docker_cmd + [
+                "/home/xls-developer/.cache/bazel/_bazel_xls-developer/970c5c2433bb6038ab152477a024c421/execroot/_main/bazel-out/k8-opt/bin/xls/tools/codegen_main", opt_ir_file,
+                "--generator", "combinational"
+            ]
+            
+            # codegen_main also outputs to stdout
+            codegen_process = subprocess.run(codegen_cmd, check=True, capture_output=True, text=True)
+            with open(v_file, "w") as f:
+                f.write(codegen_process.stdout)
+
+            print(f"✅ Pipeline Complete! Verilog saved to: {v_file}")
+            return True, v_file
+
+        except subprocess.CalledProcessError as e:
+            print(f"❌ XLS Compilation Failed at step: {' '.join(e.cmd)}")
+            print(f"Error Log:\n{e.stderr}")
+            return False, e.stderr
+
+    def fix_compilation_error(self, bad_code: str, error_log: str, target_compiler: str) -> CppCorrection:
+        print(f"Reflection Agent triggered: Analyzing compiler errors for [{target_compiler}]...")
+        
+        compiler_rules = {
+            "google xls": """
+                1. DO NOT use Xilinx Vitis HLS libraries. NO #include "ap_int.h". NO ap_uint.
+                2. DO NOT use Xilinx pragmas. NO #pragma HLS INTERFACE.
+                3. For Google XLS, you MUST use exactly one top-level pragma: `#pragma hls_top` placed immediately before the top-level evaluation function.
+                4. DO NOT use ANY #include directives (NO #include <cstdint>). The compiler environment is stripped. 
+                5. Use native C++ built-in types instead of stdint: use `unsigned char` for 8-bit, `unsigned short` for 16-bit, `unsigned int` for 32-bit, and `bool`.
+                6. Always include an explicit active-low reset signal (e.g., rst_n) in the top-level evaluation function parameters and use if (!rst_n) to clear internal states.
+                7. LOOP UNROLLING: Every single `for` loop MUST be immediately preceded by `#pragma hls_unroll yes` to ensure it is synthesized as combinational logic. 
+            """,
+            "vitis hls": """
+                1. Use standard Xilinx Vitis HLS libraries. You MUST #include "ap_int.h" and use ap_uint/ap_int types.
+                2. Apply appropriate #pragma HLS INTERFACE and #pragma HLS PIPELINE directives.
+                3. Use strictly standard C++ libraries like <cstdint> (e.g., uint8_t, uint16_t, bool).
+            """
+        }
+        
+        selected_rules = compiler_rules["vitis hls"] if "vitis" in target_compiler.lower() else compiler_rules["google xls"]
+
+        system_prompt = f"""
+        You are an expert {target_compiler} C++ debugging agent. 
+        
+        CRITICAL STRICT RULES:
+        {selected_rules}
+        - DO NOT include ANY comments. Provide ONLY the raw logic.
+        - IMPORTANT: Output as a JSON string. Escape newlines as \\n and use single quotes in the code.
+        """
+
+        prompt = f"""
+        The following C++ HLS code failed to compile.
+        
+        [CODE]
+        {bad_code}
+        
+        [COMPILER ERROR LOG]
+        {error_log}
+        
+        Fix the errors and provide the corrected C++ code. Keep it clean and synthesizable.
+        """
+
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()}
+        ]
+        
+        return robust_completion(self.model, messages, CppCorrection)
+
+class CirbuildVerifierAgent:
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        self.model = model_name
+
+    def generate_cpp_testbench(self, plan: PseudocodePlan, target_compiler: str, generated_cpp: str) -> CppTestbench:
+        print(f"Step 4: Generating C++ Testbench for [{target_compiler}]...")
+        
+        compiler_rules = {
+            "google xls": """
+                1. Use standard C++ types (<cstdint>). DO NOT use Xilinx ap_int.h.
+                2. Assume the module uses an active-low reset (rst_n) if it requires reset logic.
+            """,
+            "vitis hls": """
+                1. Use Xilinx Vitis HLS libraries (#include "ap_int.h").
+            """
+        }
+        
+        selected_rules = compiler_rules["vitis hls"] if "vitis" in target_compiler.lower() else compiler_rules["google xls"]
+
+        system_prompt = f"""
+        You are an expert hardware verification engineer targeting {target_compiler}.
+        Write a C++ testbench for the described hardware module.
+        
+        CRITICAL STRICT RULES:
+        {selected_rules}
+
+        [HARDWARE INTEGRATION]
+        - The hardware module is ALREADY included via '#include "{output_filename}"'.
+        - CRITICAL: DO NOT add any other local #include directives (e.g., NO #include "fir_filter.h").
+        - All necessary structs (like FirState) and functions are already available from the primary include. 
+        - Do not redefine any hardware logic, classes, or structs.
+        - ONLY include standard libraries (<iostream>, <deque>, etc.).
+
+        [TESTING STRATEGY]
+        - Write ALGORITHMIC testbenches (use `for` loops, boundary checks, edge-case generation). Avoid unrolled, brute-force assert lines.
+        - DYNAMIC ASSERTIONS: Compute expected values dynamically at runtime using a software shadow-state (e.g., std::deque). Do not hardcode expected output arrays.
+        - STATE SYNCHRONIZATION: If you assert a hardware reset (!rst_n), you MUST simultaneously clear your shadow-state variables to match.
+        - Always use loops for shift register propagation.
+
+        [FORMATTING & OUTPUT]
+        - Write ONLY the `int main()` function and necessary standard includes.
+        - Provide ONLY raw C++ logic. Zero comments (// or /*) are allowed.
+        - Success/Failure: Print "TEST PASSED" and return 0 on success. Return 1 on failure.
+        - JSON FORMAT: Output as a valid JSON string. Use standard C++ double quotes for literals (e.g., "TEST PASSED") and escape them properly for JSON.
+        """
+        
+        prompt = f"""
+        Module Name: {plan.module_name}
+        I/O Interface: {plan.inputs_outputs}
+        Expected Behavior: {plan.logic_steps}
+
+        Generated C++ Hardware Module (Already Included in environment):
+        {generated_cpp}
+
+        [STRUCTURAL TEMPLATE FOR TESTBENCH]
+        You MUST follow this exact architectural skeleton, but replace the generic types, functions, and logic with the specific requirements of the module described above:
+
+        ```cpp
+        #include <iostream>
+        #include <cassert>
+        // Include any required data structures for the shadow state (e.g., <deque>, <vector>)
+        #include "module.cpp"
+
+        int main() {{
+            // 1. Initialize Software Shadow State
+            <ShadowStateType> shadow_state; 
+            
+            // 2. Hardware Reset & Shadow State Synchronization
+            <module_function_name>(<zero_inputs>, false, ...); 
+            // IMMEDIATELY reset the shadow state to match!
+            shadow_state.clear(); // (or equivalent reset logic)
+
+            // 3. Algorithmic Test Loop (Edge cases, sweeps, or randoms)
+            for (int i = 0; i < <NUM_TESTS>; ++i) {{
+                // a. Generate bounded dynamic test inputs (e.g., modulo the max bit-width)
+                // b. Update software shadow state
+                // c. Compute expected output dynamically from the shadow state
+                // d. Evaluate hardware and assert
+                if (hw_out != expected_out) {{
+                    return 1;
+                }}
+            }}
+            
+            std::cout << "TEST PASSED" << std::endl;
+            return 0;
+        }}
+        ```
+        """
+        
+        messages=[
+             {"role": "system", "content": system_prompt.strip()},
+             {"role": "user", "content": prompt.strip()}
+        ]
+        return robust_completion(self.model, messages, CppTestbench)
+# ---------------------------------------------------------------------------
+# 3. Execution Block
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    sample_spec = """
+    Module Name: 4-Tap Moving Average Filter
+    Target Compiler: Google XLS
+    
+    Description:
+    Design a 4-tap moving average filter.
+    
+    I/O Interface:
+    - Input: 8-bit unsigned integer named 'data_in'
+    - Output: 8-bit unsigned integer named 'data_out'
+    
+    Timing & Logic:
+    - The filter updates every single clock cycle.
+    - It calculates the average of the last 4 inputs.
+    """
+
+    planner_agent = CirbuildProgressiveCoder(model_name="gemini/gemini-2.5-flash")
+    coder_agent = CirbuildProgressiveCoder(model_name=DEFAULT_MODEL)
+    reflection_agent = CirbuildReflectionAgent(model_name=DEFAULT_MODEL)
+    verifier_agent = CirbuildVerifierAgent(model_name=DEFAULT_MODEL) 
+    
+    try:
+        # ---------------------------------------------------------
+        # Phase 1: Core Generation
+        # ---------------------------------------------------------
+        plan = planner_agent.understand_and_plan(sample_spec)
+        py_model = coder_agent.generate_python_gold_model(plan)
+        cpp_target = coder_agent.generate_hls_cpp(py_model, plan.target_compiler)
+
+        final_cpp_code = cpp_target.cpp_code
+        if "google xls" in plan.target_compiler.lower():
+            final_cpp_code = coder_agent.patch_xls_headers(final_cpp_code)
+        
+        safe_name = plan.module_name.strip().lower().replace(" ", "_").replace("-", "_")
+        output_filename = f"{safe_name}_hls.cpp"
+        
+        with open(output_filename, "w") as file:
+            file.write(final_cpp_code.replace('\\n', '\n'))
+            
+        print(f"\n✅ Phase 1: Initial C++ Code Saved to {output_filename}")
+
+        # ---------------------------------------------------------
+        # Phase 2: Core Syntax Check & Reflection
+        # ---------------------------------------------------------
+        compile_status = reflection_agent.mock_compile_check(output_filename)
+        
+        if compile_status != "SUCCESS":
+            print(f"\n❌ Phase 2: Core Compilation Failed. Passing to Reflection Agent...\nError:\n{compile_status}")
+            
+            correction = reflection_agent.fix_compilation_error(cpp_target.cpp_code, compile_status, plan.target_compiler)
+            
+            with open(output_filename, "w") as file:
+                file.write(correction.fixed_cpp_code.replace('\\n', '\n'))
+                
+            print(f"\n🔧 Code Fixed! Explanation: {correction.explanation}")
+        else:
+            print("\n✅ Phase 2: Core C++ passed syntax check on the first try!")
+
+        # ---------------------------------------------------------
+        # Phase 3: Testbench Generation
+        # ---------------------------------------------------------
+        
+        cpp_tb = verifier_agent.generate_cpp_testbench(plan, plan.target_compiler, cpp_target.cpp_code)
+        
+        tb_filename = f"{safe_name}_tb.cpp"
+        with open(tb_filename, "w") as file:
+            include_statement = f'#include "{output_filename}"\n\n'
+            file.write(include_statement + cpp_tb.testbench_code.replace('\\n', '\n'))
+            
+        print(f"\n✅ Phase 3: C++ Testbench Saved to {tb_filename}")
+        print(f"   Test Scenarios Covered: {cpp_tb.test_cases_covered}")
+
+        # ---------------------------------------------------------
+        # Phase 4: Full Compilation & Execution
+        # ---------------------------------------------------------
+        print(f"\n⚙️ Phase 4: Compiling and Executing Testbench in WSL...")
+        executable_name = f"./{safe_name}_tb_exec"
+
+        try:
+            # 1. Compile the testbench (which includes the core code)
+            subprocess.run(
+                ["g++", tb_filename, "-o", executable_name],
+                capture_output=True,
+                text=True,
+                check=True 
+            )
+            print("✅ Compilation Successful.")
+
+            # 2. Run the compiled executable
+            run_process = subprocess.run(
+                [executable_name],
+                capture_output=True,
+                text=True,
+                check=True 
+            )
+
+            print("\n📊 Testbench Output:")
+            print(run_process.stdout.strip())
+
+            # 3. Verify the output
+            if "TEST PASSED" in run_process.stdout:
+                print("\n🏆 VERIFICATION SUCCESSFUL: The hardware logic is functionally correct!")
+                # ---------------------------------------------------------
+                # Phase 5: Full HLS to Verilog Pipeline
+                # ---------------------------------------------------------
+                # Note: Replace 'your_xls_image_name' with your actual local Docker image tag
+                success, output_info = reflection_agent.run_full_xls_pipeline(
+                    cpp_filename=output_filename, 
+                    docker_image="cirbuild-xls:v1" 
+                )
+            
+                if success:
+                    print(f"\n🎉 EDA Pipeline Complete! Ready for FPGA synthesis.")
+                    print(f"📄 Final RTL: {output_info}")
+                else:
+                    print(f"\n❌ XLS Compiler Pipeline Failed:\n{output_info}")
+            else:
+                print("\n❌ VERIFICATION FAILED: The logic did not produce the expected outputs.")
+
+        except subprocess.CalledProcessError as e:
+            print(f"\n❌ Pipeline Execution Failed.")
+            if e.cmd[0] == 'g++':
+                print(f"Testbench Compiler Error Log:\n{e.stderr}")
+            else:
+                print(f"Runtime/Assertion Error Log:\n{e.stderr}")
+
+    except Exception as e:
+        print(f"\nPipeline critical failure: {e}")

@@ -1,15 +1,22 @@
-# CirbuildSTG Core Dependencies
-# This file contains all dependencies for the CirbuildSTG suite
+# CirbuildSTG Dependencies
+# ========================
 
-# Cirbuild-Spec2RTL Subsystem Dependencies
-# Core package
-pypdfium2>=4.0.0
-autogen-agentchat>=0.2.0
+# Spec2RTL backend (installed as package — uses its own LLM config internally)
+git+https://github.com/CirbuildProject/Cirbuild-Spec2RTL.git@main
+
+# Agent LLM (dedicated channel, separate from spec2rtl backend)
 litellm>=1.0.0
+
+# Data validation
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
+
+# Configuration
 pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Templating (for agent prompts)
 jinja2>=3.0.0
 
-# Cirbuild Subsystems (installs the main Spec2RTL package)
-git+https://github.com/CirbuildProject/Cirbuild-Spec2RTL.git@main
+# CLI display
+rich>=13.0.0

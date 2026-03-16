@@ -1,0 +1,24 @@
+# CirbuildSTG Agent Configuration
+# ================================
+# Separate from spec2rtl backend config.
+# Override with CIRBUILD_ prefixed environment variables.
+
+# --- Agent LLM (dedicated channel, NOT shared with spec2rtl) ---
+agent_model: "openrouter/minimax/minimax-m2.5"
+agent_fallback_models:
+  - "openrouter/google/gemini-2.5-flash"
+  - "openrouter/deepseek/deepseek-v3.2"
+agent_temperature: 0.3
+agent_max_tokens: 8192
+
+# --- Workspace ---
+workspace_dir: "cirbuild_workspace"
+
+# --- Librelane ---
+librelane_repo_path: "../librelane"
+librelane_pdk_root: "~/.ciel"
+librelane_pdk: "sky130A"
+
+# --- Spec2RTL Backend ---
+# Leave null to use spec2rtl's own default_config.yaml
+spec2rtl_config_path: null
