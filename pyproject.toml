@@ -5,36 +5,35 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cirbuild-stg"
 version = "0.1.0"
-description = "CirbuildSTG - Agentic AI EDA tool for Spec-to-GDSII workflow"
+description = "AI-Powered Spec-to-GDSII IC Design Assistant"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "CirbuildProject Contributors"}
+    {name = "CirbuildSTG Contributors"}
 ]
 dependencies = [
-    "pypdfium2>=4.0.0",
-    "autogen-agentchat>=0.2.0",
     "litellm>=1.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
     "jinja2>=3.0.0",
-    "git+https://github.com/CirbuildProject/Cirbuild-Spec2RTL.git@main",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
+spec2rtl = [
+    "spec2rtl @ git+https://github.com/CirbuildProject/Cirbuild-Spec2RTL.git@main",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
 
 [project.scripts]
-cirbuild-stg = "cirbuild_stg.__main__:main"
+cirbuild = "cirbuild.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cirbuild_stg*"]
-
-[tool.setuptools]
-package-dir = {"" = "."}
+include = ["cirbuild*"]
