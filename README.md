@@ -356,3 +356,9 @@ pip install --upgrade --force-reinstall git+https://github.com/CirbuildProject/C
 ## License
 
 MIT
+
+## ⚠️ Disclaimer
+
+This project is completely written, debugged, and verified via the use of the **Antigravity** agentic IDE and Kilo Code Extension in VS Code IDE, utilizing models of Claude Opus 4.6, Claude Sonnet 4.6, Gemini 3.1 Pro, and Minimax M2.5. Any generated code through this pipeline should be manually verified before mission-critical use (e.g., research literature, commercial usage, etc.). The architectural considerations and progressive refinements are genuine human intent. 
+
+Note: This project is not intended for production use, and primarily structured to be a Proof of Concept for educational / pedagogical purposes. 
