@@ -42,6 +42,7 @@ def print_help() -> None:
 | Command | Description |
 |---------|-------------|
 | `/spec <file>` | Load a spec file (PDF, TXT, JSON) and run pipeline |
+| `/load <file> [module_name]` | Load an existing .v/.sv file directly into workspace (no pipeline) |
 | `/workspace` | List files in the Verilog workspace |
 | `/edit <file>` | Show a workspace file for discussion |
 | `/package <module>` | Package workspace for Librelane |
@@ -98,6 +99,25 @@ def handle_command(command: str, agent: CirbuildAgent) -> bool:
                 response = agent.chat(
                     f"Run the Spec2RTL pipeline on this file: {file_path}"
                 )
+                console.print(Markdown(response))
+
+    elif cmd == "load":
+        if not arg:
+            console.print("[red]Usage: /load <file_path> [module_name][/red]")
+        else:
+            load_parts = arg.split(maxsplit=1)
+            verilog_path = Path(load_parts[0])
+            module_override = load_parts[1] if len(load_parts) > 1 else ""
+            if not verilog_path.exists():
+                console.print(f"[red]File not found: {verilog_path}[/red]")
+            else:
+                console.print(
+                    f"[dim]Loading Verilog file '{verilog_path}' directly into workspace...[/dim]"
+                )
+                msg = f"Load this Verilog file directly into the workspace: {verilog_path.resolve()}"
+                if module_override:
+                    msg += f" Use module name: {module_override}"
+                response = agent.chat(msg)
                 console.print(Markdown(response))
 
     elif cmd == "workspace":
@@ -168,12 +188,12 @@ def run_cli(config_path: Path | None = None) -> None:
             continue
 
         # Regular message — route to agent
-        with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-            try:
-                response = agent.chat(user_input)
-            except Exception as exc:
-                console.print(f"[red]Agent error: {exc}[/red]")
-                continue
+        console.print("\n[dim italic] Cirbuild is processing...[/dim italic]")
+        try:
+            response = agent.chat(user_input)
+        except Exception as exc:
+            console.print(f"[red]Agent error: {exc}[/red]")
+            continue
 
         console.print()
         console.print(

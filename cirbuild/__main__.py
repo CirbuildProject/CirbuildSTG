@@ -7,11 +7,15 @@ Usage:
 
 import argparse
 import sys
+import logging
 from pathlib import Path
 
 
 def main() -> int:
     """Parse CLI arguments and launch the Cirbuild agent."""
+    logging.basicConfig(level=logging.INFO, format="[dim]%(message)s[/dim]")
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    litellm.suppress_debug_info = True
     parser = argparse.ArgumentParser(
         prog="cirbuild",
         description="CirbuildSTG — AI-Powered Spec-to-GDSII IC Design Assistant",

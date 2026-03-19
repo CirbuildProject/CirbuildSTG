@@ -49,12 +49,75 @@ class WorkspaceManager:
     def _safe_path(self, filename: str) -> Path:
         """Resolve filename and ensure it stays within the active workspace."""
         if not self._active_module:
-            raise RuntimeError("No active workspace. Run a pipeline first.")
+            raise RuntimeError(
+                "No active workspace module. "
+                "Use scan_workspace to find existing modules in cirbuild_workspace/, "
+                "then activate_workspace_module to select one. "
+                "Or run the Spec2RTL pipeline to generate a new module."
+            )
         module_dir = (self._root / self._active_module).resolve()
         resolved = (module_dir / filename).resolve()
         if not resolved.is_relative_to(module_dir):
             raise ValueError(f"Path traversal detected: {filename!r}")
         return resolved
+
+    def activate_module(self, module_name: str) -> Path:
+        """Activate an existing workspace module without copying any files.
+
+        Use this when the user has manually placed files in the workspace
+        directory and wants the agent to work with them directly.
+
+        Args:
+            module_name: Name of the module directory under workspace_root.
+
+        Returns:
+            Path to the module's workspace directory.
+
+        Raises:
+            FileNotFoundError: If the module directory does not exist.
+        """
+        safe_name = (
+            str(module_name).strip().lower().replace(" ", "_").replace("-", "_")
+        )
+        module_dir = self._root / safe_name
+        if not module_dir.exists():
+            raise FileNotFoundError(
+                f"Workspace directory not found: {module_dir}. "
+                "Check that the module name matches the directory name."
+            )
+        self._active_module = safe_name
+        logger.info("Activated workspace module: %s", safe_name)
+        return module_dir
+
+    def scan_for_modules(self) -> List[Dict]:
+        """Scan the workspace root for existing module directories.
+
+        Returns all subdirectories that contain at least one .v or .sv file.
+        Useful when the user has manually placed files in the workspace.
+
+        Returns:
+            List of dicts with keys: module_name, directory, files.
+        """
+        found: List[Dict] = []
+        if not self._root.exists():
+            return found
+
+        for entry in sorted(self._root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            verilog_files = [
+                f.name
+                for f in entry.iterdir()
+                if f.is_file() and f.suffix.lower() in (".v", ".sv") and not f.name.startswith(".")
+            ]
+            if verilog_files:
+                found.append({
+                    "module_name": entry.name,
+                    "directory": str(entry),
+                    "files": verilog_files,
+                })
+
+        return found
 
     def init_from_synthesis(
         self,
@@ -73,8 +136,18 @@ class WorkspaceManager:
         Returns:
             Path to the workspace directory.
         """
+        # Validate and sanitize module_name
+        if not module_name or not str(module_name).strip():
+            # Fallback to RTL filename if module_name is empty/None
+            rtl_file = Path(rtl_path).stem
+            module_name = rtl_file or "unknown_module"
+            logger.warning(
+                "Module name was empty; using RTL filename fallback: %s",
+                module_name,
+            )
+        
         safe_name = (
-            module_name.strip().lower().replace(" ", "_").replace("-", "_")
+            str(module_name).strip().lower().replace(" ", "_").replace("-", "_")
         )
         module_dir = self._root / safe_name
         module_dir.mkdir(parents=True, exist_ok=True)
@@ -83,15 +156,19 @@ class WorkspaceManager:
         history_dir = module_dir / ".history"
         history_dir.mkdir(exist_ok=True)
 
-        # Copy RTL file
+        # Copy RTL file with standardized naming
         src = Path(rtl_path)
         if src.exists():
-            dest = module_dir / src.name
+            # Use module name for the RTL file, preserving extension
+            rtl_extension = src.suffix  # e.g., ".v" or ".sv"
+            dest_filename = f"{safe_name}{rtl_extension}"
+            dest = module_dir / dest_filename
             shutil.copy2(src, dest)
             # Save initial version to history
             self._save_history(dest)
             logger.info(
-                "Initialized workspace for '%s' from %s", safe_name, src
+                "Initialized workspace for '%s' from %s → %s",
+                safe_name, src.name, dest_filename
             )
         else:
             logger.warning("RTL file not found: %s", rtl_path)
@@ -155,7 +232,12 @@ class WorkspaceManager:
             RuntimeError: If no workspace is active.
         """
         if not self._active_module:
-            raise RuntimeError("No active workspace. Run a pipeline first.")
+            raise RuntimeError(
+                "No active workspace module. "
+                "Use scan_workspace to find existing modules in cirbuild_workspace/, "
+                "then activate_workspace_module to select one. "
+                "Or run the Spec2RTL pipeline to generate a new module."
+            )
 
         module_dir = self._root / self._active_module
         if not module_dir.exists():
@@ -238,7 +320,12 @@ class WorkspaceManager:
         """
         mod = module_name or self._active_module
         if not mod:
-            raise RuntimeError("No active workspace. Run a pipeline first.")
+            raise RuntimeError(
+                "No active workspace module. "
+                "Use scan_workspace to find existing modules in cirbuild_workspace/, "
+                "then activate_workspace_module to select one. "
+                "Or run the Spec2RTL pipeline to generate a new module."
+            )
 
         module_dir = self._root / mod
         if not module_dir.exists():

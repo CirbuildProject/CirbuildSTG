@@ -32,4 +32,5 @@ Test_output_C++ (monolith)/
 Verilog_sample
 clean_codebase_STG.txt
 *tests
-*memory/
+*memory/hls_fixes/
+*Zone.Identifier

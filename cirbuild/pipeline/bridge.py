@@ -156,10 +156,12 @@ class Spec2RTLBridge:
             spec_text = file_path.read_text(encoding="utf-8")
             artifacts.spec_text = spec_text
             result = pipeline.run_from_text(spec_text, target_compiler)
+            artifacts.module_name = result.module_name
 
         elif suffix == ".pdf":
             artifacts.spec_text = f"[PDF file: {file_path.name}]"
             result = pipeline.run(file_path, target_compiler)
+            artifacts.module_name = result.module_name
 
         else:
             raise ValueError(
@@ -199,6 +201,7 @@ class Spec2RTLBridge:
         result = pipeline.run_from_text(spec_text, target_compiler)
 
         artifacts.success = result.success
+        artifacts.module_name = result.module_name
         artifacts.rtl_path = result.rtl_output_path
         artifacts.error_log = result.error_log
 

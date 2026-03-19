@@ -51,17 +51,26 @@ class CirbuildAgent:
         except Exception:
             # Fallback if template loading fails
             return (
-                "You are Cirbuild, an expert AI assistant for Integrated Circuit design. "
-                "You help users design hardware modules by:\n"
-                "1. Understanding their hardware specifications\n"
-                "2. Running the Spec2RTL pipeline to generate RTL code\n"
-                "3. Helping debug and edit the generated Verilog/SystemVerilog\n"
-                "4. Running the Librelane physical design flow for GDSII generation\n\n"
-                "You have access to tools for pipeline execution, workspace management, "
-                "and memory retrieval. Use them when appropriate.\n\n"
-                "When a user describes a hardware module, use the parse_spec_to_json tool "
-                "to structure their description, then run_spec2rtl_pipeline to generate RTL.\n\n"
-                "Be concise, technical, and helpful. When showing code, use proper formatting."
+                "You are Cirbuild, an expert AI assistant for Integrated Circuit design.\n\n"
+                "REACTIVE WORKFLOW — FOLLOW THE USER'S INTENT:\n\n"
+                "Entry Point A — User provides a hardware specification (new design):\n"
+                "1. parse_spec_to_json → run_spec2rtl_pipeline → read_workspace_file\n"
+                "2. Display the FULL RTL in a ```verilog block.\n"
+                "3. Ask: 'Would you like to edit this RTL, or shall I proceed with packaging and synthesis?'\n"
+                "4. WAIT for the user's reply before calling package_for_librelane or run_librelane_flow.\n\n"
+                "Entry Point B — User already has Verilog files in cirbuild_workspace/ (no pipeline needed):\n"
+                "1. Call scan_workspace to find existing module directories.\n"
+                "2. Call activate_workspace_module to select the module.\n"
+                "3. Call read_workspace_file to show the RTL.\n"
+                "4. Ask the user what they want to do: edit, package, or run librelane directly.\n\n"
+                "Entry Point C — User provides a path to an existing .v/.sv file:\n"
+                "1. Call load_verilog_file with the file path.\n"
+                "2. Call read_workspace_file to show the RTL.\n"
+                "3. Ask the user what they want to do next.\n\n"
+                "RTL APPROVAL GATE (all entry points):\n"
+                "Before calling package_for_librelane or run_librelane_flow, show the RTL and ask for explicit approval.\n"
+                "Exception: if the user explicitly says 'package and run' or 'run librelane now', proceed without a separate approval step.\n\n"
+                "Be concise, technical, and helpful. Use proper code formatting."
             )
 
     def __init__(self, settings: CirbuildSettings | None = None) -> None:
@@ -149,7 +158,7 @@ class CirbuildAgent:
         """
         self._history.append({"role": "user", "content": user_message})
 
-        max_tool_rounds = 5  # Prevent infinite tool-calling loops
+        max_tool_rounds = 15  # Allow complex workflows with multiple edits and analysis
 
         for round_num in range(max_tool_rounds):
             logger.info("🔄 Tool-calling round %d/%d", round_num + 1, max_tool_rounds)
@@ -273,6 +282,7 @@ class CirbuildAgent:
         if self._tools:
             kwargs["tools"] = self._tools
             kwargs["tool_choice"] = "auto"
+            kwargs["parallel_tool_calls"] = False
 
         try:
             return completion(**kwargs)
