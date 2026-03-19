@@ -8,6 +8,7 @@ Usage:
 import argparse
 import sys
 import logging
+import litellm
 from pathlib import Path
 
 
