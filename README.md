@@ -39,11 +39,11 @@ The name stands for **Circuit Builder Spec-To-GDSII**.
 └────────┼─────────────────────────────────┼──────────────┘
          │                                 │
          v                                 v
-  ┌──────────────┐                  ┌──────────────┐
-  │ Cirbuild-    │                  │ librelane    │
-  │ Spec2RTL     │                  │ (OpenLane)   │
-  │ (backend)    │                  │              │
-  └──────────────┘                  └──────────────┘
+   ┌──────────────┐                  ┌──────────────┐
+   │ Cirbuild-    │                  │ librelane    │
+   │ Spec2RTL     │                  │ (OpenLane)   │
+   │ (backend)    │                  │              │
+   └──────────────┘                  └──────────────┘
 ```
 
 **Key design decisions:**
@@ -53,6 +53,22 @@ The name stands for **Circuit Builder Spec-To-GDSII**.
 - **Subprocess isolation for Librelane** — Librelane runs as a subprocess to avoid dependency conflicts.
 - **In-memory BM25 RAG** — Session-scoped keyword retrieval over pipeline artifacts. No external embedding models required.
 - **Workspace with history** — Automatic snapshots enable undo during interactive editing sessions.
+
+---
+
+## Tech Stack
+
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| **Agent LLM** | [LiteLLM](https://docs.litellm.ai/) | Unified API for multiple LLM providers (OpenRouter, Gemini, Anthropic) |
+| **Data Validation** | [Pydantic](https://docs.pydantic.dev/) | Schema validation for hardware specifications |
+| **Configuration** | [PyYAML](https://pyyaml.org/) + python-dotenv | YAML config files with env var overrides |
+| **Templating** | [Jinja2](https://jinja.palletsprojects.com/) | Agent system prompt templates |
+| **CLI UI** | [Rich](https://rich.readthedocs.io/) | Rich terminal output with Markdown rendering |
+| **RAG Memory** | Custom BM25 implementation | Keyword-based retrieval without external embeddings |
+| **RTL Generation** | [Cirbuild-Spec2RTL](https://github.com/CirbuildProject/Cirbuild-Spec2RTL) | LLM-powered spec-to-RTL pipeline |
+| **Physical Design** | [Librelane](https://github.com/CirbuildProject/librelane) | OpenLane/OpenROAD wrapper for RTL-to-GDSII |
+| **Containerization** | Docker + Nix | Reproducible toolchain environments |
 
 ---
 
@@ -130,6 +146,7 @@ If you prefer complete transparency or want to modify the XLS environment, you c
 # Run this from the root of the CirbuildSTG directory
 docker build -t cirbuild-xls:v1 .
 ```
+
 ---
 
 ## Quick Start
@@ -196,7 +213,7 @@ Messages without a `/` prefix are routed to the LLM agent for natural conversati
 
 ## Agent Tools
 
-The agent has 9 tools available for autonomous operation:
+The agent has 12 tools available for autonomous operation:
 
 | Tool | Description |
 |------|-------------|
@@ -207,6 +224,9 @@ The agent has 9 tools available for autonomous operation:
 | `read_workspace_file` | Read a file from the Verilog workspace |
 | `write_workspace_file` | Write/edit a file with automatic history snapshot |
 | `list_workspace_files` | List all files in the active workspace |
+| `scan_workspace` | Scan workspace for existing module directories |
+| `activate_workspace_module` | Activate a workspace module for editing |
+| `load_verilog_file` | Load existing Verilog file directly into workspace |
 | `package_for_librelane` | Package workspace into a Librelane design directory |
 | `run_librelane_flow` | Execute the Librelane physical design flow |
 
@@ -310,7 +330,7 @@ CirbuildSTG/
 │   ├── agent/
 │   │   ├── __init__.py
 │   │   ├── client.py            # CirbuildAgent — LLM client with tool-calling loop
-│   │   ├── tools.py             # 9 tool definitions + handlers
+│   │   ├── tools.py             # 12 tool definitions + handlers
 │   │   └── prompts/
 │   │       └── system.jinja2    # Agent system prompt template
 │   ├── config/
@@ -319,7 +339,8 @@ CirbuildSTG/
 │   │   └── settings.py          # CirbuildSettings (Pydantic)
 │   ├── librelane/
 │   │   ├── __init__.py
-│   │   └── runner.py            # LibrelaneRunner — config gen + subprocess
+│   │   ├── runner.py            # LibrelaneRunner — config gen + subprocess
+│   │   └── nix_bridge.py        # Nix-shell bridge for Librelane execution
 │   ├── memory/
 │   │   ├── __init__.py
 │   │   └── rag_store.py         # BM25 RAG store — session-scoped retrieval
@@ -330,16 +351,25 @@ CirbuildSTG/
 │   └── workspace/
 │       ├── __init__.py
 │       └── manager.py           # WorkspaceManager — file editing + history
+├── docs/                        # Additional documentation
+│   ├── TECH_STACK.md           # Detailed tech stack documentation
+│   └── TUTORIALS.md            # Usage tutorials
 ├── plans/
 │   └── Cirbuild_Spec2RTL_Integration_Plan.md
-├── tests/
-│   └── fixtures/
-│       └── alu_spec.json        # Example ALU specification
 ├── pyproject.toml
 ├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
+
+---
+
+## Detailed Documentation
+
+For more detailed documentation, see the files in the `docs/` folder:
+
+- **[docs/TECH_STACK.md](docs/TECH_STACK.md)** — In-depth explanation of the technology stack, dependencies, and architecture
+- **[docs/TUTORIALS.md](docs/TUTORIALS.md)** — Step-by-step tutorials for common workflows
 
 ---
 
