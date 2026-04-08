@@ -12,7 +12,7 @@
 
 Modern IC design requires mastering a multi-tool, multi-language stack (HDL → RTL → synthesis → place-and-route → GDSII) that takes years to learn. The standard pedagogical approach drops students at the deep end with disconnected tools and no high-level guidance.
 
-CirbuildSTG orchestrates the complete pre-silicon workflow through a single conversational interface. The user describes what they want in plain English; the system decomposes the request, generates RTL via the [Cirbuild-Spec2RTL](https://github.com/CirbuildProject/Cirbuild-Spec2RTL) backend, manages the workspace, and can submit the resulting Verilog directly to a physical design flow via [Librelane](https://github.com/CirbuildProject/librelane) (OpenLane/OpenROAD). It is a **Proof of Concept** for AI-accelerated, top-down IC pedagogy.
+CirbuildSTG orchestrates the complete pre-silicon workflow through a single conversational interface. The user describes what they want in plain English; the system decomposes the request, generates RTL via the [Cirbuild-Spec2RTL](https://github.com/CirbuildProject/Cirbuild-Spec2RTL) backend, manages the workspace, and can submit the resulting Verilog directly to a physical design flow via [Librelane](https://github.com/librelane/librelane) (OpenLane/OpenROAD). It is a **Proof of Concept** for AI-accelerated, top-down IC pedagogy.
 
 **The name stands for:** *Circuit Builder — Spec-To-GDSII.*
 
