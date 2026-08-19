@@ -1,3 +1,5 @@
+
+
 # CirbuildSTG
 
 > *An agentic AI EDA assistant that takes a natural-language hardware specification and walks it all the way to a GDSII layout — giving students and engineers a guided, learn-while-building IC design experience.*
@@ -325,7 +327,7 @@ The agent has **12 tools** for autonomous operation:
 |---|---|
 | `parse_spec_to_json` | Parse natural-language spec into validated `JsonHardwareSpec` |
 | `run_spec2rtl_pipeline` | Invoke Spec2RTL with a JSON spec; returns RTL path and artifacts |
-| `run_spec2rtl_from_file` | Invoke Spec2RTL from PDF/TXT file |
+| `run_spec2rtl_from_file` | Invoke Spec2RTL from PDF/TXT/JSON file |
 | `query_memory` | BM25 search over stored specs, pseudocode, and RTL |
 | `read_workspace_file` | Read a file from the Verilog workspace |
 | `write_workspace_file` | Write/edit a file; auto-snapshots previous version |
